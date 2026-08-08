@@ -39,18 +39,18 @@ an interactive Claude Code session.
 
 ## Using it from Claude Code
 
-**Use the `ollama` fish abbr, not bare `claude`:**
+**Use the `ollama-cc` fish abbr, not bare `claude`:**
 
 ```bash
-ollama                    # interactive, deepseek-v4-flash:0731
-ollama -p "..."           # headless
+ollama-cc                    # interactive, deepseek-v4-flash:0731
+ollama-cc -p "..."           # headless
 ```
 
 Defined in `~/.config/fish/conf.d/myabbrs.fish` alongside the other
 model-switch abbrs (`gpt`, `glm`, `minimax`, `deepseek`):
 
 ```fish
-abbr -a -- ollama 'env -u ANTHROPIC_BASE_URL -u ANTHROPIC_API_BASE_URL -u CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY claude --dangerously-skip-permissions --settings ~/.claude/settings.ollama-cloud.json'
+abbr -a -- ollama-cc 'env -u ANTHROPIC_BASE_URL -u ANTHROPIC_API_BASE_URL -u CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY claude --dangerously-skip-permissions --settings ~/.claude/settings.ollama-cloud.json'
 ```
 
 The `env -u` prefix unsets three env vars a parent Claude Code session leaks
