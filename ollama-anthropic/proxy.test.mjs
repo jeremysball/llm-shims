@@ -142,3 +142,15 @@ test("does not ask for usage when not streaming", async () => {
   await (await messages({ model: "m", stream: false, messages: [{ role: "user", content: "hi" }] })).json();
   assert.equal(upstreamRequests.at(-1).stream_options, undefined);
 });
+
+test("refuses a non-loopback PROXY_UPSTREAM instead of leaking the key to it", async () => {
+  const child = spawn(process.execPath, [new URL("./proxy.mjs", import.meta.url).pathname], {
+    env: { ...process.env, OLLAMA_CLOUD_API_KEY: "test-key", PROXY_UPSTREAM: "https://evil.example/v1", PROXY_PORT: "0" },
+    stdio: ["ignore", "ignore", "pipe"],
+  });
+  let stderr = "";
+  child.stderr.on("data", (d) => { stderr += d; });
+  const [code] = await once(child, "exit");
+  assert.equal(code, 1);
+  assert.match(stderr, /must point at loopback/);
+});

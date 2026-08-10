@@ -15,7 +15,27 @@
 
 import http from "node:http";
 
-const UPSTREAM = process.env.PROXY_UPSTREAM || "https://ollama.com/v1/chat/completions";
+// PROXY_UPSTREAM exists so the tests can point this at a fake upstream. Every
+// request carries the Ollama Cloud key in an Authorization header, so an
+// override that reached a remote host would hand the key to it; loopback only,
+// and a violation is fatal rather than silently ignored.
+const UPSTREAM = resolveUpstream(process.env.PROXY_UPSTREAM);
+
+function resolveUpstream(override) {
+  if (!override) return "https://ollama.com/v1/chat/completions";
+  let host;
+  try {
+    host = new URL(override).hostname;
+  } catch {
+    console.error(`PROXY_UPSTREAM is not a valid URL: ${override}`);
+    process.exit(1);
+  }
+  if (host !== "127.0.0.1" && host !== "::1" && host !== "localhost") {
+    console.error(`PROXY_UPSTREAM must point at loopback, got host ${host}`);
+    process.exit(1);
+  }
+  return override;
+}
 const PORT = Number(process.env.PROXY_PORT || 3445);
 const API_KEY = process.env.OLLAMA_CLOUD_API_KEY;
 const MODEL = process.env.PROXY_MODEL || "deepseek-v4-flash:0731";
@@ -216,7 +236,12 @@ async function bufferTranslated(upstreamRes, reply, clientModel, reqId) {
     content.push({ type: "tool_use", id: tc.id, name: tc.function.name, input });
   }
   const stopReason = FINISH_TO_STOP_REASON[json.choices?.[0]?.finish_reason] || "end_turn";
-  const usage = { input_tokens: json.usage?.prompt_tokens || 0, output_tokens: json.usage?.completion_tokens || 0 };
+  const usage = {
+    input_tokens: json.usage?.prompt_tokens || 0,
+    output_tokens: json.usage?.completion_tokens || 0,
+    cache_creation_input_tokens: 0,
+    cache_read_input_tokens: 0,
+  };
   reply.writeHead(200, { "Content-Type": "application/json" });
   reply.end(JSON.stringify({ id: reqId, type: "message", role: "assistant", model: clientModel, content, stop_reason: stopReason, usage }));
 }
