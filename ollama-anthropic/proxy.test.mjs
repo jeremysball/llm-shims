@@ -3,7 +3,7 @@
 // Claude Code -- lives entirely in the wire format, so anything that stubs
 // out the HTTP layer would have missed it.
 //
-//   node --test ollama-anthropic/
+//   node --test ollama-anthropic/*.test.mjs
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
@@ -59,31 +59,38 @@ before(async () => {
   });
   upstreamPort = await listen(upstream);
 
-  // Borrow a free port from the OS and hand it straight to the proxy.
-  const probe = http.createServer();
-  proxyPort = await listen(probe);
-  probe.close();
-  await once(probe, "close");
-
+  // Let the proxy atomically claim an OS-assigned port, then read the actual
+  // address from its startup log. Reserving and releasing a port before spawn
+  // leaves a race where another process can bind it first.
   proxy = spawn(process.execPath, [new URL("./proxy.mjs", import.meta.url).pathname], {
     env: {
       ...process.env,
       OLLAMA_CLOUD_API_KEY: "test-key",
       PROXY_UPSTREAM: `http://127.0.0.1:${upstreamPort}/v1/chat/completions`,
-      PROXY_PORT: String(proxyPort),
+      PROXY_PORT: "0",
     },
     stdio: ["ignore", "ignore", "pipe"],
   });
+  const [listening] = await once(proxy.stderr, "data");
+  const match = String(listening).match(/listening on http:\/\/127\.0\.0\.1:(\d+)/);
+  assert.ok(match, `proxy did not report its listening address: ${listening}`);
+  proxyPort = Number(match[1]);
+
   // The proxy logs its listening line to stderr; wait for the socket instead
   // of racing it.
+  let healthy = false;
   for (let i = 0; i < 100; i++) {
     try {
       const res = await fetch(`http://127.0.0.1:${proxyPort}/healthz`);
-      if (res.ok) break;
+      if (res.ok) {
+        healthy = true;
+        break;
+      }
     } catch {
       await new Promise((r) => setTimeout(r, 50));
     }
   }
+  assert.ok(healthy, "proxy never became healthy");
 });
 
 after(() => {
@@ -141,6 +148,19 @@ test("reports usage on the non-streaming path too", async () => {
 test("does not ask for usage when not streaming", async () => {
   await (await messages({ model: "m", stream: false, messages: [{ role: "user", content: "hi" }] })).json();
   assert.equal(upstreamRequests.at(-1).stream_options, undefined);
+});
+
+test("accepts an IPv6 loopback PROXY_UPSTREAM", async () => {
+  const child = spawn(process.execPath, [new URL("./proxy.mjs", import.meta.url).pathname], {
+    env: { ...process.env, OLLAMA_CLOUD_API_KEY: "test-key", PROXY_UPSTREAM: "http://[::1]:8080/v1", PROXY_PORT: "0" },
+    stdio: ["ignore", "ignore", "pipe"],
+  });
+  let stderr = "";
+  child.stderr.on("data", (d) => { stderr += d; });
+  await once(child.stderr, "data");
+  assert.doesNotMatch(stderr, /must point at loopback/);
+  child.kill();
+  await once(child, "exit");
 });
 
 test("refuses a non-loopback PROXY_UPSTREAM instead of leaking the key to it", async () => {
