@@ -30,7 +30,7 @@ function resolveUpstream(override) {
     console.error(`PROXY_UPSTREAM is not a valid URL: ${override}`);
     process.exit(1);
   }
-  if (host !== "127.0.0.1" && host !== "::1" && host !== "localhost") {
+  if (host !== "127.0.0.1" && host !== "[::1]" && host !== "localhost") {
     console.error(`PROXY_UPSTREAM must point at loopback, got host ${host}`);
     process.exit(1);
   }
@@ -333,7 +333,8 @@ const server = http.createServer(async (req, reply) => {
 });
 
 server.listen(PORT, "127.0.0.1", () => {
-  log(`ollama-anthropic-proxy listening on http://127.0.0.1:${PORT}`);
+  const { port } = server.address();
+  log(`ollama-anthropic-proxy listening on http://127.0.0.1:${port}`);
   log(`model: ${MODEL}`);
 });
 
