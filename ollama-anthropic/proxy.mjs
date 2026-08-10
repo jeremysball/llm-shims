@@ -6,13 +6,16 @@
 // Verified wire details (this session):
 //   UPSTREAM: POST https://ollama.com/v1/chat/completions
 //     headers: Authorization: Bearer <OLLAMA_CLOUD_API_KEY>
-//     body:    {model, messages, stream, tools} — standard OpenAI chat-completions shape
+//     body:    {model, messages, stream, stream_options, tools} — standard
+//     OpenAI chat-completions shape
 //     streaming tool calls confirmed via curl: delta.tool_calls[].function.{name,arguments}
 //     arrive incrementally, keyed by index (not always id) — see toolBlocksByIndex below.
+//     token usage only arrives if stream_options.include_usage is asked for,
+//     and then only in a final chunk that carries an empty choices array.
 
 import http from "node:http";
 
-const UPSTREAM = "https://ollama.com/v1/chat/completions";
+const UPSTREAM = process.env.PROXY_UPSTREAM || "https://ollama.com/v1/chat/completions";
 const PORT = Number(process.env.PROXY_PORT || 3445);
 const API_KEY = process.env.OLLAMA_CLOUD_API_KEY;
 const MODEL = process.env.PROXY_MODEL || "deepseek-v4-flash:0731";
@@ -98,6 +101,12 @@ function buildChatRequest(anth) {
     messages: translateMessages(anth),
     stream: anth.stream !== false,
   };
+  // Without this, Ollama Cloud streams no usage at all and every turn is
+  // reported to Claude Code as costing zero tokens, which leaves the
+  // statusline's context gauge permanently blank. Verified against
+  // ollama.com: absent include_usage, no chunk in the stream carries a usage
+  // object; present, a final chunk does.
+  if (req.stream) req.stream_options = { include_usage: true };
   const tools = translateTools(anth.tools);
   if (tools) req.tools = tools;
   return req;
@@ -117,6 +126,9 @@ async function streamTranslated(upstreamRes, reply, clientModel, reqId) {
     Connection: "keep-alive",
   });
 
+  // Zeroed usage in message_start is correct and matches what OpenRouter's
+  // Anthropic endpoint sends: the real numbers are only known once upstream
+  // finishes, so they ride on message_delta and Claude Code merges them.
   reply.write(sse({ type: "message_start", message: { id: reqId, type: "message", role: "assistant", model: clientModel, content: [], stop_reason: null, usage: { input_tokens: 0, output_tokens: 0 } } }));
   reply.write(sse({ type: "ping" }));
 
@@ -125,7 +137,7 @@ async function streamTranslated(upstreamRes, reply, clientModel, reqId) {
   const toolBlocksByIndex = new Map(); // openai tool_call index -> {blockIndex, opened}
   let nextBlockIndex = 1;
   let stopReason = "end_turn";
-  let usage = { input_tokens: 0, output_tokens: 0 };
+  let usage = { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 };
   let buffer = "";
 
   const reader = upstreamRes.body.getReader();
@@ -143,6 +155,17 @@ async function streamTranslated(upstreamRes, reply, clientModel, reqId) {
       if (!dataLine || dataLine === "[DONE]") continue;
       let ev;
       try { ev = JSON.parse(dataLine); } catch { continue; }
+
+      // The usage chunk arrives last and carries choices: [], so this has to
+      // come before the choice guard below or it gets thrown away.
+      if (ev.usage) {
+        usage = {
+          input_tokens: ev.usage.prompt_tokens || 0,
+          output_tokens: ev.usage.completion_tokens || 0,
+          cache_creation_input_tokens: 0,
+          cache_read_input_tokens: 0,
+        };
+      }
 
       const choice = ev.choices?.[0];
       if (!choice) continue;
@@ -172,9 +195,6 @@ async function streamTranslated(upstreamRes, reply, clientModel, reqId) {
 
       if (choice.finish_reason) {
         stopReason = FINISH_TO_STOP_REASON[choice.finish_reason] || "end_turn";
-      }
-      if (ev.usage) {
-        usage = { input_tokens: ev.usage.prompt_tokens || 0, output_tokens: ev.usage.completion_tokens || 0 };
       }
     }
   }

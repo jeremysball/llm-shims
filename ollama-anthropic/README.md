@@ -58,11 +58,35 @@ and silently reroute requests to a different backend.
 Verified end-to-end through Claude Code itself: text response and a real
 Bash tool round-trip both confirmed live (2026-08-08).
 
+## Tests
+
+```bash
+node --test 'ollama-anthropic/*.test.mjs'      # from the repo root
+```
+
+They spawn the real proxy as a subprocess against a fake upstream and talk to
+it over a real socket, because the faults worth catching here live in the wire
+format. `PROXY_UPSTREAM` exists for that: it overrides the ollama.com endpoint
+and is not used in production.
+
 ## Endpoints
 
 - `POST /v1/messages` — Anthropic Messages (streaming + non-streaming, including tool calls)
 - `GET /v1/models` — lists the configured model
 - `GET /healthz` — liveness + key-presence check
+
+## Token usage
+
+Ollama Cloud only sends token counts when the request carries
+`stream_options.include_usage`, and then only in a final chunk whose `choices`
+array is empty. The proxy asks for it and forwards the numbers on
+`message_delta`, which is where Claude Code picks them up — the same place
+OpenRouter's Anthropic endpoint puts them. `message_start` reports zeroes
+because upstream hasn't counted anything yet at that point; that is expected,
+not a bug.
+
+Without both halves of that, every turn is reported as costing zero tokens and
+the statusline's context gauge reads `n/a`.
 
 ## Caveats
 
