@@ -64,6 +64,23 @@ function translateSystem(system) {
   return null;
 }
 
+// Anthropic tool_use.input is always an object per spec; the string case is
+// defensive only. Native /api/chat rejects a JSON-encoded *string* here with
+// a 400 ("Value looks like object, but can't find closing '}' symbol") --
+// confirmed by replaying a captured request straight against ollama.com.
+// Unlike the OpenAI-compatible shape, native wants a real object.
+function toArgumentsObject(input) {
+  if (input && typeof input === "object") return input;
+  if (typeof input === "string") {
+    try {
+      return JSON.parse(input);
+    } catch {
+      return {};
+    }
+  }
+  return {};
+}
+
 // Translates Anthropic messages to native ChatMessage objects. Native bundles
 // tool calls into the assistant message that produced them, so a tool_use block
 // is folded onto the previous assistant message's tool_calls array; a
@@ -106,7 +123,7 @@ function translateMessages(anth) {
           type: "function",
           function: {
             name: block.name,
-            arguments: typeof block.input === "string" ? block.input : JSON.stringify(block.input ?? {}),
+            arguments: toArgumentsObject(block.input),
           },
         });
       } else if (block.type === "tool_result") {
