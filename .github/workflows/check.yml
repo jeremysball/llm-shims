@@ -1,0 +1,47 @@
+name: check
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    # One collapsed job rather than per-leg matrix legs: each leg would claim
+    # its own GitHub-hosted runner, and with several PRs open that saturates
+    # this account's concurrent-runner cap and leaves jobs sitting `queued`
+    # for 10-20+ minutes without starting. One job means one runner request
+    # per push/PR. It costs matrix parallelism (lint/typecheck/unit run
+    # sequentially instead of side by side), a reasonable trade against
+    # everything queuing indefinitely.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up mise (reads mise.toml for the pinned Node version)
+        uses: jdx/mise-action@v2
+
+      - name: Cache npm dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-npm-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-npm-
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Run lint
+        run: npm run lint
+
+      - name: Run typecheck
+        run: npm run typecheck
+
+      - name: Run unit tests
+        run: npm run test:unit

@@ -17,9 +17,12 @@ const UPSTREAM_CHUNKS = [
   { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "" }, done: true, done_reason: "stop", prompt_eval_count: 4242, eval_count: 17 },
 ];
 
+/** @type {Object[]} */
 let upstreamChunks = UPSTREAM_CHUNKS;
 let upstreamChunkDelayMs = 0;
+/** @type {Promise<void> | null} */
 let upstreamHoldAfterFirstChunk = null;
+/** @type {Object} */
 let upstreamMessage = {
   model: "deepseek-v4-flash:0731",
   message: { role: "assistant", content: "hi" },
@@ -28,15 +31,27 @@ let upstreamMessage = {
   prompt_eval_count: 4242,
   eval_count: 17,
 };
+/** @type {http.Server | undefined} */
 let upstream;
+/** @type {number} */
 let upstreamPort;
+/** @type {import("node:child_process").ChildProcess | undefined} */
 let proxy;
+/** @type {number} */
 let proxyPort;
 /** Bodies the proxy sent upstream, newest last. */
+/** @type {any[]} */
 const upstreamRequests = [];
 
+/**
+ * @param {http.Server} server
+ * @returns {Promise<number>}
+ */
 function listen(server) {
-  return new Promise((resolve) => server.listen(0, "127.0.0.1", () => resolve(server.address().port)));
+  return new Promise((resolve) => server.listen(0, "127.0.0.1", () => {
+    const address = server.address();
+    resolve(typeof address === "object" && address ? address.port : 0);
+  }));
 }
 
 before(async () => {
@@ -73,6 +88,7 @@ before(async () => {
     },
     stdio: ["ignore", "ignore", "pipe"],
   });
+  if (!proxy.stderr) throw new Error("proxy has no stderr");
   const [listening] = await once(proxy.stderr, "data");
   const match = String(listening).match(/listening on http:\/\/127\.0\.0\.1:(\d+)/);
   assert.ok(match, `proxy did not report its listening address: ${listening}`);
@@ -114,6 +130,10 @@ beforeEach(() => {
   };
 });
 
+/**
+ * @param {Object} body
+ * @returns {Promise<Response>}
+ */
 async function messages(body) {
   return fetch(`http://127.0.0.1:${proxyPort}/v1/messages`, {
     method: "POST",
@@ -143,9 +163,11 @@ test("streams and forwards usage from the done frame on message_delta", async ()
 });
 
 test("starts forwarding a plain-text response before upstream completes", async () => {
-  let releaseUpstream;
+  /** @type {() => void} */
+  let releaseUpstream = () => {};
   upstreamHoldAfterFirstChunk = new Promise((resolve) => { releaseUpstream = resolve; });
   const res = await messages({ model: "m", stream: true, messages: [{ role: "user", content: "hi" }] });
+  if (!res.body) throw new Error("response has no body");
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let text = "";
@@ -182,7 +204,7 @@ test("keeps end_turn for a fragmented streaming plain-text response", async () =
 
 test("reports usage on the non-streaming path too", async () => {
   const res = await messages({ model: "m", stream: false, messages: [{ role: "user", content: "hi" }] });
-  const body = await res.json();
+  const body = /** @type {any} */ (await res.json());
   assert.equal(body.usage.input_tokens, 4242);
   assert.equal(body.usage.output_tokens, 17);
 });
@@ -208,7 +230,7 @@ test("reports tool_use when non-streaming native tool calls end with an ordinary
     messages: [{ role: "user", content: "find it" }],
   });
 
-  assert.equal((await res.json()).stop_reason, "tool_use");
+  assert.equal((/** @type {any} */ (await res.json())).stop_reason, "tool_use");
 });
 
 test("generates a tool-use id for non-streaming native tool calls without one", async () => {
@@ -227,7 +249,7 @@ test("generates a tool-use id for non-streaming native tool calls without one", 
     tools: [{ name: "Bash", description: "Run a command", input_schema: { type: "object", properties: {} } }],
     messages: [{ role: "user", content: "find it" }],
   });
-  const body = await res.json();
+  const body = /** @type {any} */ (await res.json());
 
   assert.match(body.content[0]?.id, /^toolu_native_/);
 });
@@ -256,7 +278,7 @@ test("sends a prior tool_use turn's arguments upstream as an object, not a JSON 
     ],
   });
 
-  const sent = upstreamRequests.at(-1).messages.find((m) => m.role === "assistant" && m.tool_calls);
+  const sent = upstreamRequests.at(-1).messages.find((/** @type {any} */ m) => m.role === "assistant" && m.tool_calls);
   assert.deepEqual(sent.tool_calls[0].function.arguments, { command: "pwd" });
 });
 
@@ -702,13 +724,17 @@ test("translates DSML in non-streaming responses", async () => {
     tools: [{ name: "Bash", description: "Run a command", input_schema: { type: "object", properties: {} } }],
     messages: [{ role: "user", content: "find it" }],
   });
-  const body = await res.json();
+  const body = /** @type {any} */ (await res.json());
 
-  assert.deepEqual(body.content.map((block) => [block.type, block.name, block.input]), [["tool_use", "Bash", { command: "pwd" }]]);
+  assert.deepEqual(body.content.map((/** @type {any} */ block) => [block.type, block.name, block.input]), [["tool_use", "Bash", { command: "pwd" }]]);
   assert.equal(body.stop_reason, "tool_use");
 });
 
 // Reads a streamed response into the parsed SSE payloads, in wire order.
+/**
+ * @param {Object} body
+ * @returns {Promise<any[]>}
+ */
 async function streamEvents(body) {
   const res = await messages(body);
   return (await res.text())
@@ -720,6 +746,10 @@ async function streamEvents(body) {
 // Block lifecycle on the wire: every start is matched by a stop, and no block
 // stays open while another one starts. This is the invariant that makes the
 // stream reconstructible by index or by stop order — they must agree.
+/**
+ * @param {any[]} events
+ * @returns {number[]}
+ */
 function assertBlocksAreSequential(events) {
   let open = null;
   const closed = [];
@@ -811,7 +841,7 @@ test("translates a non-streaming message.thinking into a leading thinking conten
   };
 
   const res = await messages({ model: "m", stream: false, messages: [{ role: "user", content: "hi" }] });
-  const body = await res.json();
+  const body = /** @type {any} */ (await res.json());
 
   // Thinking first, and the same flat shape the streaming path emits.
   assert.deepEqual(body.content, [
@@ -832,7 +862,7 @@ test("forwards an echoed thinking block upstream as message.thinking", async () 
   })).text();
 
   const sent = upstreamRequests.at(-1).messages;
-  const assistant = sent.find((m) => m.role === "assistant");
+  const assistant = sent.find((/** @type {any} */ m) => m.role === "assistant");
   assert.equal(assistant.thinking, "Prior reasoning.");
   assert.equal(assistant.content, "Prior answer.");
 });
@@ -878,7 +908,12 @@ test("refuses a non-loopback PROXY_UPSTREAM instead of leaking the key to it", a
 // Boots the real proxy with PROXY_THINK set to `value` and reads back the flag
 // the proxy resolved from it. The env is parsed once at module load, so a
 // subprocess is the only way to exercise it.
+/**
+ * @param {string | undefined} value
+ * @returns {Promise<boolean>}
+ */
 async function resolvedThinkFlag(value) {
+  /** @type {Record<string, string | undefined>} */
   const env = { ...process.env, OLLAMA_CLOUD_API_KEY: "test-key", PROXY_PORT: "0" };
   delete env.PROXY_THINK;
   if (value !== undefined) env.PROXY_THINK = value;
@@ -888,9 +923,11 @@ async function resolvedThinkFlag(value) {
   });
   try {
     const [startup] = await once(child.stderr, "data");
-    const port = String(startup).match(/127\.0\.0\.1:(\d+)/)[1];
+    const match = String(startup).match(/127\.0\.0\.1:(\d+)/);
+    if (!match) throw new Error("proxy did not report its listening address");
+    const port = match[1];
     const res = await fetch(`http://127.0.0.1:${port}/healthz`);
-    return (await res.json()).think;
+    return (/** @type {any} */ (await res.json())).think;
   } finally {
     child.kill();
     await once(child, "exit");

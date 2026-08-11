@@ -21,12 +21,102 @@
 
 import http from "node:http";
 
+// ---------- shapes on the wire (typed for `tsc --checkJs`, not enforced at runtime) ----------
+
+/**
+ * @typedef {Object} AnthropicContentBlock
+ * @property {string} type
+ * @property {string} [text]
+ * @property {string} [thinking]
+ * @property {string} [id]
+ * @property {string} [name]
+ * @property {*} [input]
+ * @property {*} [content]
+ */
+
+/**
+ * @typedef {Object} AnthropicMessage
+ * @property {string} role
+ * @property {string | AnthropicContentBlock[]} content
+ */
+
+/**
+ * @typedef {Object} AnthropicToolDef
+ * @property {string} name
+ * @property {string} [description]
+ * @property {Object} [input_schema]
+ * @property {Object} [parameters]
+ */
+
+/**
+ * @typedef {Object} AnthropicRequest
+ * @property {string | AnthropicContentBlock[]} [system]
+ * @property {AnthropicMessage[]} [messages]
+ * @property {AnthropicToolDef[]} [tools]
+ * @property {boolean} [stream]
+ * @property {string} [model]
+ */
+
+/**
+ * @typedef {Object} NativeToolCallFunction
+ * @property {string} [name]
+ * @property {*} [arguments]
+ * @property {number} [index]
+ */
+
+/**
+ * @typedef {Object} NativeToolCall
+ * @property {string} [id]
+ * @property {string} [type]
+ * @property {NativeToolCallFunction} [function]
+ */
+
+/**
+ * @typedef {Object} NativeChatMessage
+ * @property {string} role
+ * @property {string | null} [content]
+ * @property {string} [thinking]
+ * @property {NativeToolCall[]} [tool_calls]
+ */
+
+/**
+ * @typedef {Object} NativeChatRequest
+ * @property {string} model
+ * @property {NativeChatMessage[]} messages
+ * @property {boolean} stream
+ * @property {boolean} [think]
+ * @property {Object[]} [tools]
+ */
+
+/** @typedef {{name: string, input: Record<string, string>}} DsmlInvocation */
+/** @typedef {{type: "text", text: string}} DsmlTextPart */
+/** @typedef {{type: "tool"} & DsmlInvocation} DsmlToolPart */
+/** @typedef {DsmlTextPart | DsmlToolPart} DsmlPart */
+
+/**
+ * @typedef {Object} ToolBlock
+ * @property {number|null} blockIndex
+ * @property {boolean} [emitted]
+ * @property {string} [arguments]
+ * @property {{type: "tool_use", id: string, name: string, input: Object}} contentBlock
+ */
+
+/** @typedef {{type: "native", block: ToolBlock}} DeferredNativeEvent */
+/** @typedef {{type: "dsml", invocation: DsmlInvocation}} DeferredDsmlEvent */
+/** @typedef {{type: "thinking", text: string}} DeferredThinkingEvent */
+/** @typedef {{type: "text", text: string}} DeferredTextEvent */
+/** @typedef {DeferredNativeEvent | DeferredDsmlEvent | DeferredThinkingEvent | DeferredTextEvent} DeferredEvent */
+
 // PROXY_UPSTREAM exists so the tests can point this at a fake upstream. Every
 // request carries the Ollama Cloud key in an Authorization header, so an
 // override that reached a remote host would hand the key to it; loopback only,
 // and a violation is fatal rather than silently ignored.
 const UPSTREAM = resolveUpstream(process.env.PROXY_UPSTREAM);
 
+/**
+ * @param {string | undefined} override
+ * @returns {string}
+ */
 function resolveUpstream(override) {
   if (!override) return "https://ollama.com/api/chat";
   let host;
@@ -53,6 +143,10 @@ const MODEL = process.env.PROXY_MODEL || "deepseek-v4-flash:0731";
 // opposite of what they configured.
 const THINK = !isFalsey(process.env.PROXY_THINK);
 
+/**
+ * @param {string | undefined} value
+ * @returns {boolean}
+ */
 function isFalsey(value) {
   return /^(false|0|off|no)$/i.test((value ?? "").trim());
 }
@@ -63,6 +157,10 @@ if (!API_KEY) {
 }
 
 // ---------- Anthropic Messages -> native /api/chat request translation ----------
+/**
+ * @param {AnthropicRequest["system"]} system
+ * @returns {string | null}
+ */
 function translateSystem(system) {
   if (!system) return null;
   if (typeof system === "string") return system;
@@ -77,6 +175,10 @@ function translateSystem(system) {
 // a 400 ("Value looks like object, but can't find closing '}' symbol") --
 // confirmed by replaying a captured request straight against ollama.com.
 // Unlike the OpenAI-compatible shape, native wants a real object.
+/**
+ * @param {*} input
+ * @returns {Object}
+ */
 function toArgumentsObject(input) {
   if (input && typeof input === "object") return input;
   if (typeof input === "string") {
@@ -93,7 +195,12 @@ function toArgumentsObject(input) {
 // tool calls into the assistant message that produced them, so a tool_use block
 // is folded onto the previous assistant message's tool_calls array; a
 // tool_result block becomes its own role:"tool" message.
+/**
+ * @param {AnthropicRequest} anth
+ * @returns {NativeChatMessage[]}
+ */
 function translateMessages(anth) {
+  /** @type {NativeChatMessage[]} */
   const out = [];
   const sys = translateSystem(anth.system);
   if (sys) out.push({ role: "system", content: sys });
@@ -119,6 +226,7 @@ function translateMessages(anth) {
       } else if (block.type === "tool_use") {
         // Fold onto the previous assistant message if present; native requires
         // tool_calls on an assistant message. Otherwise synthesize one.
+        /** @type {NativeChatMessage | null} */
         let target = null;
         if (last && last.role === "assistant" && Array.isArray(last.tool_calls)) {
           target = last;
@@ -139,7 +247,7 @@ function translateMessages(anth) {
         });
       } else if (block.type === "tool_result") {
         const out2 = Array.isArray(block.content)
-          ? block.content.map((c) => c.text ?? JSON.stringify(c)).join("\n")
+          ? block.content.map((/** @type {*} */ c) => c.text ?? JSON.stringify(c)).join("\n")
           : typeof block.content === "string"
             ? block.content
             : JSON.stringify(block.content ?? "");
@@ -156,6 +264,7 @@ function translateMessages(anth) {
         if (textParts.length) foldTarget.content = textParts.join("");
         if (thinking) foldTarget.thinking = thinking;
       } else {
+        /** @type {NativeChatMessage} */
         const entry = { role, content: textParts.join("") };
         if (thinking) entry.thinking = thinking;
         out.push(entry);
@@ -165,6 +274,10 @@ function translateMessages(anth) {
   return out;
 }
 
+/**
+ * @param {AnthropicToolDef[] | undefined} tools
+ * @returns {Object[] | undefined}
+ */
 function translateTools(tools) {
   if (!Array.isArray(tools)) return undefined;
   return tools.map((t) => ({
@@ -177,7 +290,12 @@ function translateTools(tools) {
   }));
 }
 
+/**
+ * @param {AnthropicRequest} anth
+ * @returns {NativeChatRequest}
+ */
 function buildChatRequest(anth) {
+  /** @type {NativeChatRequest} */
   const req = {
     model: MODEL,
     messages: translateMessages(anth),
@@ -190,21 +308,34 @@ function buildChatRequest(anth) {
 }
 
 // ---------- native /api/chat NDJSON -> Anthropic SSE translation ----------
+/**
+ * @param {{type: string} & Record<string, *>} obj
+ * @returns {string}
+ */
 function sse(obj) {
   return `event: ${obj.type}\ndata: ${JSON.stringify(obj)}\n\n`;
 }
 
+/** @type {Record<string, string>} */
 const FINISH_TO_STOP_REASON = { tool_calls: "tool_use", length: "max_tokens", stop: "end_turn" };
 
+/**
+ * @param {Set<string>} offeredToolNames
+ */
 function createDsmlDecoder(offeredToolNames) {
   const open = "<｜DSML｜invoke name=\"";
   const close = "</｜DSML｜invoke>";
   let buffer = "";
 
+  /**
+   * @param {string} source
+   * @returns {DsmlInvocation | null}
+   */
   function parseInvocation(source) {
     const match = source.match(/^<｜DSML｜invoke name="([^"]+)">\n([\s\S]*)<\/｜DSML｜invoke>$/);
     if (!match || !offeredToolNames.has(match[1])) return null;
 
+    /** @type {Record<string, string>} */
     const input = {};
     const parameter = /<｜DSML｜parameter name="([^"]+)">([\s\S]*?)(?:<｜DSML｜parameter>|<\/｜DSML｜parameter>)/g;
     let offset = 0;
@@ -213,11 +344,16 @@ function createDsmlDecoder(offeredToolNames) {
       Object.defineProperty(input, item[1], { value: item[2], enumerable: true });
       offset = parameter.lastIndex;
     }
-    if (match[2].slice(offset).trim() || offset === 0 && match[2].trim()) return null;
+    if (match[2].slice(offset).trim() || (offset === 0 && match[2].trim())) return null;
     return { name: match[1], input };
   }
 
+  /**
+   * @param {boolean} [final]
+   * @returns {DsmlPart[]}
+   */
   function drain(final = false) {
+    /** @type {DsmlPart[]} */
     const parts = [];
     while (buffer) {
       const start = buffer.indexOf(open);
@@ -257,16 +393,30 @@ function createDsmlDecoder(offeredToolNames) {
   }
 
   return {
+    /**
+     * @param {string} text
+     * @returns {DsmlPart[]}
+     */
     push(text) {
       buffer += text;
       return drain();
     },
+    /**
+     * @returns {DsmlPart[]}
+     */
     finish() {
       return drain(true);
     },
   };
 }
 
+/**
+ * @param {Response} upstreamRes
+ * @param {http.ServerResponse} reply
+ * @param {string | undefined} clientModel
+ * @param {string} reqId
+ * @param {Set<string>} offeredToolNames
+ */
 async function streamTranslated(upstreamRes, reply, clientModel, reqId, offeredToolNames) {
   reply.writeHead(200, {
     "Content-Type": "text/event-stream",
@@ -280,18 +430,22 @@ async function streamTranslated(upstreamRes, reply, clientModel, reqId, offeredT
   reply.write(sse({ type: "message_start", message: { id: reqId, type: "message", role: "assistant", model: clientModel, content: [], stop_reason: null, usage: { input_tokens: 0, output_tokens: 0 } } }));
   reply.write(sse({ type: "ping" }));
 
+  /** @type {{blockIndex: number} | null} */
   let textBlock = null;
   // Native streams message.thinking as incremental string fragments (each frame
   // carries the next chunk, not a cumulative prefix), so coalesce them into a
   // single Anthropic thinking block: start on the first fragment, one
   // thinking_delta per subsequent chunk. Same { blockIndex } shape as textBlock
   // so both share one close helper and neither guard trips on index 0.
+  /** @type {{blockIndex: number} | null} */
   let thinkingBlock = null;
   // A native tool call may be interleaved with later content deltas. Anthropic
   // blocks cannot receive deltas after their stop event, so defer events after
   // the first native tool call; ordinary text still streams.
   let deferContent = false;
+  /** @type {Map<string, ToolBlock>} */
   const toolBlocksByKey = new Map();
+  /** @type {DeferredEvent[]} */
   const deferredEvents = [];
   let emittedToolUse = false;
   let anonymousToolCallCount = 0;
@@ -300,6 +454,7 @@ async function streamTranslated(upstreamRes, reply, clientModel, reqId, offeredT
   let usage = { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 };
   const dsml = createDsmlDecoder(offeredToolNames);
 
+  /** @param {{blockIndex: number} | null} block */
   const closeBlock = (block) => {
     if (!block) return;
     reply.write(sse({ type: "content_block_stop", index: block.blockIndex }));
@@ -312,6 +467,7 @@ async function streamTranslated(upstreamRes, reply, clientModel, reqId, offeredT
     closeBlock(thinkingBlock);
     thinkingBlock = null;
   };
+  /** @param {ToolBlock} block */
   const emitNativeToolBlock = (block) => {
     if (block.emitted) return;
     closeTextBlock();
@@ -328,6 +484,7 @@ async function streamTranslated(upstreamRes, reply, clientModel, reqId, offeredT
       if (event.type === "native") emitNativeToolBlock(event.block);
       else if (event.type === "dsml") {
         const blockIndex = nextBlockIndex++;
+        /** @type {ToolBlock} */
         const block = {
           blockIndex,
           contentBlock: { type: "tool_use", id: `toolu_dsml_${Math.random().toString(36).slice(2, 12)}`, name: event.invocation.name, input: {} },
@@ -347,6 +504,7 @@ async function streamTranslated(upstreamRes, reply, clientModel, reqId, offeredT
     }
     deferContent = false;
   };
+  /** @param {string} text */
   const emitText = (text) => {
     if (!text) return;
     if (deferContent) {
@@ -365,6 +523,7 @@ async function streamTranslated(upstreamRes, reply, clientModel, reqId, offeredT
   // Thinking rides the same defer queue as text so that a fragment arriving
   // after a native tool call is replayed in order rather than racing ahead of
   // the deferred tool block.
+  /** @param {string} text */
   const emitThinking = (text) => {
     if (!text) return;
     if (deferContent) {
@@ -380,17 +539,20 @@ async function streamTranslated(upstreamRes, reply, clientModel, reqId, offeredT
     }
     reply.write(sse({ type: "content_block_delta", index: thinkingBlock.blockIndex, delta: { type: "thinking_delta", thinking: text } }));
   };
+  /** @param {ToolBlock} block */
   const emitToolUse = (block) => {
     closeThinkingBlock();
     closeTextBlock();
     reply.write(sse({ type: "content_block_start", index: block.blockIndex, content_block: block.contentBlock }));
   };
+  /** @param {DsmlInvocation} invocation */
   const emitDsmlInvocation = (invocation) => {
     emittedToolUse = true;
     stopReason = "tool_use";
     deferContent = true;
     deferredEvents.push({ type: "dsml", invocation });
   };
+  /** @param {DsmlPart[]} parts */
   const emitDsmlParts = (parts) => {
     for (const part of parts) {
       if (part.type === "text") emitText(part.text);
@@ -401,6 +563,7 @@ async function streamTranslated(upstreamRes, reply, clientModel, reqId, offeredT
   // A native /api/chat frame is a single JSON object per line (NDJSON), unlike
   // the OpenAI SSE frames this proxy previously translated. The final frame has
   // done:true and carries the usage stats.
+  /** @param {string} frame */
   const processFrame = (frame) => {
     if (!frame.trim()) return;
     let ev;
@@ -460,6 +623,7 @@ async function streamTranslated(upstreamRes, reply, clientModel, reqId, offeredT
     }
   };
 
+  if (!upstreamRes.body) throw new Error("upstream response has no body");
   const reader = upstreamRes.body.getReader();
   const dec = new TextDecoder();
   let buffer = "";
@@ -496,9 +660,17 @@ async function streamTranslated(upstreamRes, reply, clientModel, reqId, offeredT
   reply.end();
 }
 
+/**
+ * @param {Response} upstreamRes
+ * @param {http.ServerResponse} reply
+ * @param {string | undefined} clientModel
+ * @param {string} reqId
+ * @param {Set<string>} offeredToolNames
+ */
 async function bufferTranslated(upstreamRes, reply, clientModel, reqId, offeredToolNames) {
-  const json = await upstreamRes.json();
+  const json = /** @type {any} */ (await upstreamRes.json());
   const msg = json.message || {};
+  /** @type {Object[]} */
   const content = [];
   let dsmlToolUse = false;
   // Thinking goes first, and carries the same flat { thinking, signature } shape
@@ -523,7 +695,7 @@ async function bufferTranslated(upstreamRes, reply, clientModel, reqId, offeredT
   }
   for (const tc of msg.tool_calls || []) {
     let input = {};
-    try { input = typeof tc.function?.arguments === "string" ? JSON.parse(tc.function.arguments) : tc.function?.arguments || {}; } catch {}
+    try { input = typeof tc.function?.arguments === "string" ? JSON.parse(tc.function.arguments) : tc.function?.arguments || {}; } catch { /* leave input as {} */ }
     content.push({ type: "tool_use", id: tc.id || `toolu_native_${Math.random().toString(36).slice(2, 12)}`, name: tc.function?.name, input });
   }
   const upstreamStopReason = FINISH_TO_STOP_REASON[json.done_reason] || "end_turn";
@@ -541,6 +713,10 @@ async function bufferTranslated(upstreamRes, reply, clientModel, reqId, offeredT
 }
 
 // ---------- HTTP server ----------
+/**
+ * @param {AnthropicRequest} anth
+ * @param {http.ServerResponse} reply
+ */
 async function forward(anth, reply) {
   const reqBody = buildChatRequest(anth);
   const clientModel = anth.model;
@@ -571,8 +747,24 @@ async function forward(anth, reply) {
   }
 }
 
+/**
+ * @param {unknown} err
+ * @returns {string}
+ */
+function errMessage(err) {
+  return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * @param {unknown} err
+ * @returns {string}
+ */
+function errStack(err) {
+  return err instanceof Error && err.stack ? err.stack : errMessage(err);
+}
+
 const server = http.createServer(async (req, reply) => {
-  const path = req.url.split("?")[0];
+  const path = (req.url ?? "").split("?")[0];
   const isHead = req.method === "HEAD";
   const method = isHead ? "GET" : req.method;
 
@@ -602,25 +794,26 @@ const server = http.createServer(async (req, reply) => {
   if (method === "POST" && (path === "/v1/messages" || path === "/messages")) {
     const body = await readBody();
     let bodyModel = "";
-    try { bodyModel = JSON.parse(body).model || ""; } catch {}
+    try { bodyModel = JSON.parse(body).model || ""; } catch { /* logged below with bytes only */ }
     log(`REQ ${req.method} ${req.url} model=${bodyModel} bytes=${body.length}`);
+    /** @type {AnthropicRequest} */
     let anth;
     try {
       anth = JSON.parse(body);
     } catch (e) {
       reply.writeHead(400, { "Content-Type": "application/json" });
-      reply.end(JSON.stringify({ type: "error", error: { type: "invalid_request", message: "invalid JSON body: " + e.message } }));
+      reply.end(JSON.stringify({ type: "error", error: { type: "invalid_request", message: "invalid JSON body: " + errMessage(e) } }));
       return;
     }
     try {
       await forward(anth, reply);
     } catch (e) {
-      log("forward error: " + (e?.stack || e));
+      log("forward error: " + errStack(e));
       if (!reply.headersSent) {
         reply.writeHead(500, { "Content-Type": "application/json" });
-        reply.end(JSON.stringify({ type: "error", error: { type: "proxy_error", message: String(e?.message || e) } }));
+        reply.end(JSON.stringify({ type: "error", error: { type: "proxy_error", message: errMessage(e) } }));
       } else {
-        try { reply.end(sse({ type: "error", error: { type: "proxy_error", message: String(e?.message || e) } })); } catch {}
+        try { reply.end(sse({ type: "error", error: { type: "proxy_error", message: errMessage(e) } })); } catch { /* connection already gone */ }
       }
     }
     return;
@@ -631,11 +824,13 @@ const server = http.createServer(async (req, reply) => {
 });
 
 server.listen(PORT, "127.0.0.1", () => {
-  const { port } = server.address();
+  const address = server.address();
+  const port = address && typeof address !== "string" ? address.port : PORT;
   log(`ollama-anthropic-proxy listening on http://127.0.0.1:${port}`);
   log(`model: ${MODEL}`);
 });
 
+/** @param {string} msg */
 function log(msg) {
   console.error(`[${new Date().toISOString()}] ${msg}`);
 }

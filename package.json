@@ -1,0 +1,35 @@
+{
+  "name": "llm-shims",
+  "version": "1.0.0",
+  "description": "Small local proxies that translate between a tool's expected LLM protocol and whatever the provider actually accepts",
+  "license": "MIT",
+  "author": "Jeremy Ball",
+  "homepage": "https://github.com/jeremysball/llm-shims#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jeremysball/llm-shims.git"
+  },
+  "bugs": {
+    "url": "https://github.com/jeremysball/llm-shims/issues"
+  },
+  "private": true,
+  "scripts": {
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit",
+    "test:unit": "node --test ollama-anthropic/proxy.test.mjs",
+    "test": "npm run test:unit",
+    "check": "git ls-files '*.mjs' | xargs -P4 -I{} node --check {} && npm run lint && npm run typecheck && npm test",
+    "prepare": "git config core.hooksPath .githooks || true"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=20.19.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "@types/node": "26.2.0",
+    "eslint": "10.8.1",
+    "globals": "17.9.0",
+    "typescript": "7.0.2"
+  }
+}
