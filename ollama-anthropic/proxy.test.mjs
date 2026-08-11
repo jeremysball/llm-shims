@@ -122,9 +122,9 @@ async function messages(body) {
   });
 }
 
-test("forces thinking off by default", async () => {
+test("passes thinking through by default so the model emits message.thinking", async () => {
   await (await messages({ model: "m", stream: true, messages: [{ role: "user", content: "hi" }] })).text();
-  assert.equal(upstreamRequests.at(-1).think, false);
+  assert.equal(upstreamRequests.at(-1).think, true);
 });
 
 test("streams and forwards usage from the done frame on message_delta", async () => {
@@ -706,6 +706,50 @@ test("translates DSML in non-streaming responses", async () => {
 
   assert.deepEqual(body.content.map((block) => [block.type, block.name, block.input]), [["tool_use", "Bash", { command: "pwd" }]]);
   assert.equal(body.stop_reason, "tool_use");
+});
+
+test("coalesces fragmented streaming message.thinking into one Anthropic thinking block", async () => {
+  // Native streams thinking as incremental chunks across frames; all of them
+  // must fold into a single block with one start/stop and one delta per chunk.
+  upstreamChunks = [
+    { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "Result", thinking: "Let" }, done: false },
+    { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "", thinking: " me reason" }, done: false },
+    { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "", thinking: " about this." }, done: true, done_reason: "stop", prompt_eval_count: 3, eval_count: 2 },
+  ];
+
+  const res = await messages({ model: "m", stream: true, messages: [{ role: "user", content: "hi" }] });
+  const events = (await res.text())
+    .split("\n")
+    .filter((line) => line.startsWith("data:"))
+    .map((line) => JSON.parse(line.slice(5)));
+
+  const thinkingStarts = events.filter((event) => event.type === "content_block_start" && event.content_block.type === "thinking");
+  assert.equal(thinkingStarts.length, 1, "fragments must coalesce into a single thinking block");
+  assert.equal(thinkingStarts[0].content_block.thinking.type, "signature");
+  const thinkingIndex = thinkingStarts[0].index;
+  const thinkingDeltas = events.filter((event) => event.delta?.type === "thinking_delta").map((event) => event.delta.thinking.thinking);
+  assert.deepEqual(thinkingDeltas, ["Let", " me reason", " about this."]);
+  assert.ok(events.some((event) => event.type === "content_block_stop" && event.index === thinkingIndex), "no thinking content_block_stop");
+  assert.ok(!events.some((event) => event.delta?.text?.includes("Let")), "thinking must not leak into a text delta");
+});
+
+test("translates a non-streaming message.thinking into a thinking content block", async () => {
+  upstreamMessage = {
+    model: "deepseek-v4-flash:0731",
+    message: { role: "assistant", content: "Result", thinking: "Let me reason about this." },
+    done: true,
+    done_reason: "stop",
+    prompt_eval_count: 4242,
+    eval_count: 17,
+  };
+
+  const res = await messages({ model: "m", stream: false, messages: [{ role: "user", content: "hi" }] });
+  const body = await res.json();
+
+  assert.deepEqual(body.content, [
+    { type: "text", text: "Result" },
+    { type: "thinking", thinking: "Let me reason about this." },
+  ]);
 });
 
 test("does not translate a DSML invocation for an unoffered tool", async () => {

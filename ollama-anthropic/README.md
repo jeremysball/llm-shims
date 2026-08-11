@@ -24,12 +24,15 @@ Ollama Cloud serves the same models on two endpoints, and only the native
 `/api/chat` honours the `think` switch. The OpenAI-compatible
 `/v1/chat/completions` endpoint silently ignores `think`, `reasoning`, and
 `chat_template_kwargs` spellings alike (verified 2026-08-08), so it cannot
-force thinking off. Because this proxy needs that control, it talks to the
+control thinking at all. Because this proxy needs that control, it talks to the
 native endpoint.
 
-Thinking is **forced off by default**. Set `PROXY_THINK=true` in the unit's
-`Environment=` (or the shell, when running in the foreground) to pass the
-model's thinking through.
+Thinking is **passed through by default**: the model's reasoning arrives in
+`message.thinking` and is translated into a proper Anthropic `thinking` block,
+so it renders as a collapsed thinking block in Claude Code rather than inline
+text. Set `PROXY_THINK=false` in the unit's `Environment=` (or the shell, when
+running in the foreground) to force thinking off — with it off, the model
+writes its reasoning inline into the answer, which is why the default is on.
 
 ## Running
 

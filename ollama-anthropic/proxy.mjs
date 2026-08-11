@@ -45,9 +45,12 @@ function resolveUpstream(override) {
 const PORT = Number(process.env.PROXY_PORT || 3445);
 const API_KEY = process.env.OLLAMA_CLOUD_API_KEY;
 const MODEL = process.env.PROXY_MODEL || "deepseek-v4-flash:0731";
-// PROXY_THINK=true passes the model's thinking through; the default (false)
-// forces it off. Only the native endpoint can do this on Ollama Cloud.
-const THINK = process.env.PROXY_THINK === "true";
+// PROXY_THINK=false forces thinking off. Off, the model writes its reasoning
+// inline into message.content, which then renders as plain text -- so the
+// default passes thinking through, where it arrives in message.thinking and is
+// translated into a proper Anthropic thinking block. Only the native endpoint
+// can do this on Ollama Cloud.
+const THINK = process.env.PROXY_THINK !== "false";
 
 if (!API_KEY) {
   console.error("OLLAMA_CLOUD_API_KEY is not set in the environment");
@@ -264,6 +267,12 @@ async function streamTranslated(upstreamRes, reply, clientModel, reqId, offeredT
   reply.write(sse({ type: "ping" }));
 
   let textBlock = null;
+  // Native streams message.thinking as incremental string fragments (each frame
+  // carries the next chunk, not a cumulative prefix), so coalesce them into a
+  // single Anthropic thinking block: start on the first fragment, one
+  // thinking_delta per subsequent chunk, stop when the stream ends. One block,
+  // not one per frame.
+  let thinkingBlock = null;
   // A native tool call may be interleaved with later content deltas. Anthropic
   // blocks cannot receive deltas after their stop event, so defer events after
   // the first native tool call; ordinary text still streams.
@@ -281,6 +290,11 @@ async function streamTranslated(upstreamRes, reply, clientModel, reqId, offeredT
     if (!textBlock) return;
     reply.write(sse({ type: "content_block_stop", index: textBlock.blockIndex }));
     textBlock = null;
+  };
+  const closeThinkingBlock = () => {
+    if (thinkingBlock === null) return;
+    reply.write(sse({ type: "content_block_stop", index: thinkingBlock }));
+    thinkingBlock = null;
   };
   const emitNativeToolBlock = (block) => {
     if (block.emitted) return;
@@ -362,6 +376,19 @@ async function streamTranslated(upstreamRes, reply, clientModel, reqId, offeredT
     const msg = ev.message || {};
     if (msg.content) emitDsmlParts(dsml.push(msg.content));
 
+    // Native streams message.thinking as incremental string fragments across
+    // frames, so coalesce them into one thinking block: start on the first, a
+    // thinking_delta per subsequent chunk, stop at end of stream. The empty
+    // signature form is what Claude Code accepts for a non-verifiable block.
+    if (typeof msg.thinking === "string" && msg.thinking) {
+      // Compare against null, not truthiness: a block index of 0 is falsy.
+      if (thinkingBlock === null) {
+        thinkingBlock = nextBlockIndex++;
+        reply.write(sse({ type: "content_block_start", index: thinkingBlock, content_block: { type: "thinking", thinking: { type: "signature", signature: "" } } }));
+      }
+      reply.write(sse({ type: "content_block_delta", index: thinkingBlock, delta: { type: "thinking_delta", thinking: { type: "text_delta", thinking: msg.thinking } } }));
+    }
+
     if (Array.isArray(msg.tool_calls)) {
       for (const tc of msg.tool_calls) {
         const idKey = tc.id ? `id:${tc.id}` : null;
@@ -430,6 +457,7 @@ async function streamTranslated(upstreamRes, reply, clientModel, reqId, offeredT
 
   emitDsmlParts(dsml.finish());
   emitDeferredEvents();
+  closeThinkingBlock();
   closeTextBlock();
   reply.write(sse({ type: "message_delta", delta: { stop_reason: stopReason, stop_sequence: null }, usage }));
   reply.write(sse({ type: "message_stop" }));
@@ -455,6 +483,9 @@ async function bufferTranslated(upstreamRes, reply, clientModel, reqId, offeredT
         });
       }
     }
+  }
+  if (typeof msg.thinking === "string" && msg.thinking) {
+    content.push({ type: "thinking", thinking: msg.thinking });
   }
   for (const tc of msg.tool_calls || []) {
     let input = {};
