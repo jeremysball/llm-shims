@@ -10,21 +10,23 @@ import http from "node:http";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 
-// Chunks copied from a real ollama.com response, including the final
-// usage-only chunk with its empty choices array.
+// Frames copied from a real ollama.com /api/chat NDJSON stream: content,
+// then a terminal done:true frame carrying the token usage.
 const UPSTREAM_CHUNKS = [
-  { id: "chatcmpl-1", object: "chat.completion.chunk", model: "deepseek-v4-flash:0731", choices: [{ index: 0, delta: { role: "assistant", content: "hi" }, finish_reason: null }] },
-  { id: "chatcmpl-1", object: "chat.completion.chunk", model: "deepseek-v4-flash:0731", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
-  { id: "chatcmpl-1", object: "chat.completion.chunk", model: "deepseek-v4-flash:0731", choices: [], usage: { prompt_tokens: 4242, completion_tokens: 17, total_tokens: 4259 } },
+  { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "hi" }, done: false },
+  { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "" }, done: true, done_reason: "stop", prompt_eval_count: 4242, eval_count: 17 },
 ];
 
 let upstreamChunks = UPSTREAM_CHUNKS;
 let upstreamChunkDelayMs = 0;
 let upstreamHoldAfterFirstChunk = null;
 let upstreamMessage = {
-  id: "chatcmpl-1",
-  choices: [{ index: 0, message: { role: "assistant", content: "hi" }, finish_reason: "stop" }],
-  usage: { prompt_tokens: 4242, completion_tokens: 17, total_tokens: 4259 },
+  model: "deepseek-v4-flash:0731",
+  message: { role: "assistant", content: "hi" },
+  done: true,
+  done_reason: "stop",
+  prompt_eval_count: 4242,
+  eval_count: 17,
 };
 let upstream;
 let upstreamPort;
@@ -45,18 +47,12 @@ before(async () => {
     const parsed = JSON.parse(body);
 
     if (parsed.stream) {
-      res.writeHead(200, { "Content-Type": "text/event-stream" });
-      // Ollama Cloud only emits the usage chunk when it is asked for --
-      // verified against ollama.com, and the whole reason the real proxy saw
-      // zeroes. Withholding it here keeps the tests honest.
-      const wantUsage = parsed.stream_options?.include_usage === true;
+      res.writeHead(200, { "Content-Type": "application/x-ndjson" });
       for (const [index, chunk] of upstreamChunks.entries()) {
-        if (chunk.usage && !wantUsage) continue;
-        res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+        res.write(`${JSON.stringify(chunk)}\n`);
         if (index === 0 && upstreamHoldAfterFirstChunk) await upstreamHoldAfterFirstChunk;
         if (upstreamChunkDelayMs) await new Promise((resolve) => setTimeout(resolve, upstreamChunkDelayMs));
       }
-      res.write("data: [DONE]\n\n");
       res.end();
     } else {
       res.writeHead(200, { "Content-Type": "application/json" });
@@ -72,7 +68,7 @@ before(async () => {
     env: {
       ...process.env,
       OLLAMA_CLOUD_API_KEY: "test-key",
-      PROXY_UPSTREAM: `http://127.0.0.1:${upstreamPort}/v1/chat/completions`,
+      PROXY_UPSTREAM: `http://127.0.0.1:${upstreamPort}/api/chat`,
       PROXY_PORT: "0",
     },
     stdio: ["ignore", "ignore", "pipe"],
@@ -109,9 +105,12 @@ beforeEach(() => {
   upstreamChunkDelayMs = 0;
   upstreamHoldAfterFirstChunk = null;
   upstreamMessage = {
-    id: "chatcmpl-1",
-    choices: [{ index: 0, message: { role: "assistant", content: "hi" }, finish_reason: "stop" }],
-    usage: { prompt_tokens: 4242, completion_tokens: 17, total_tokens: 4259 },
+    model: "deepseek-v4-flash:0731",
+    message: { role: "assistant", content: "hi" },
+    done: true,
+    done_reason: "stop",
+    prompt_eval_count: 4242,
+    eval_count: 17,
   };
 });
 
@@ -123,10 +122,24 @@ async function messages(body) {
   });
 }
 
-test("asks upstream for usage when streaming", async () => {
+test("forces thinking off by default", async () => {
   await (await messages({ model: "m", stream: true, messages: [{ role: "user", content: "hi" }] })).text();
-  const sent = upstreamRequests.at(-1);
-  assert.deepEqual(sent.stream_options, { include_usage: true });
+  assert.equal(upstreamRequests.at(-1).think, false);
+});
+
+test("streams and forwards usage from the done frame on message_delta", async () => {
+  const res = await messages({ model: "m", stream: true, messages: [{ role: "user", content: "hi" }] });
+  const text = await res.text();
+
+  const delta = text
+    .split("\n")
+    .filter((l) => l.startsWith("data:"))
+    .map((l) => JSON.parse(l.slice(5)))
+    .find((e) => e.type === "message_delta");
+
+  assert.ok(delta, "no message_delta in the translated stream");
+  assert.equal(delta.usage.input_tokens, 4242);
+  assert.equal(delta.usage.output_tokens, 17);
 });
 
 test("starts forwarding a plain-text response before upstream completes", async () => {
@@ -152,25 +165,10 @@ test("starts forwarding a plain-text response before upstream completes", async 
   assert.ok(text.includes("content_block_delta"));
 });
 
-test("forwards real token counts on message_delta", async () => {
-  const res = await messages({ model: "m", stream: true, messages: [{ role: "user", content: "hi" }] });
-  const text = await res.text();
-
-  const delta = text
-    .split("\n")
-    .filter((l) => l.startsWith("data:"))
-    .map((l) => JSON.parse(l.slice(5)))
-    .find((e) => e.type === "message_delta");
-
-  assert.ok(delta, "no message_delta in the translated stream");
-  assert.equal(delta.usage.input_tokens, 4242);
-  assert.equal(delta.usage.output_tokens, 17);
-});
-
 test("keeps end_turn for a fragmented streaming plain-text response", async () => {
   upstreamChunks = [
-    { id: "chatcmpl-text", object: "chat.completion.chunk", model: "deepseek-v4-flash:0731", choices: [{ index: 0, delta: { content: "This response is ordinary" }, finish_reason: null }] },
-    { id: "chatcmpl-text", object: "chat.completion.chunk", model: "deepseek-v4-flash:0731", choices: [{ index: 0, delta: { content: " text." }, finish_reason: "stop" }] },
+    { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "This response is ordinary" }, done: false },
+    { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: " text." }, done: true, done_reason: "stop", prompt_eval_count: 3, eval_count: 2 },
   ];
 
   const res = await messages({ model: "m", stream: true, messages: [{ role: "user", content: "hi" }] });
@@ -182,40 +180,6 @@ test("keeps end_turn for a fragmented streaming plain-text response", async () =
   assert.equal(events.find((event) => event.type === "message_delta")?.delta.stop_reason, "end_turn");
 });
 
-test("does not drop the usage-only chunk's stop reason", async () => {
-  const res = await messages({ model: "m", stream: true, messages: [{ role: "user", content: "hi" }] });
-  const text = await res.text();
-  const delta = text
-    .split("\n")
-    .filter((l) => l.startsWith("data:"))
-    .map((l) => JSON.parse(l.slice(5)))
-    .find((e) => e.type === "message_delta");
-  assert.equal(delta.delta.stop_reason, "end_turn");
-});
-
-test("reports tool_use when non-streaming DSML ends with an ordinary stop", async () => {
-  upstreamMessage = {
-    id: "chatcmpl-dsml",
-    choices: [{
-      index: 0,
-      message: { role: "assistant", content: "<｜DSML｜invoke name=\"Bash\">\n<｜DSML｜parameter name=\"command\">pwd<｜DSML｜parameter>\n</｜DSML｜invoke>" },
-      finish_reason: "stop",
-    }],
-    usage: { prompt_tokens: 4242, completion_tokens: 17, total_tokens: 4259 },
-  };
-
-  const res = await messages({
-    model: "m",
-    stream: false,
-    tools: [{ name: "Bash", description: "Run a command", input_schema: { type: "object", properties: {} } }],
-    messages: [{ role: "user", content: "find it" }],
-  });
-  const body = await res.json();
-
-  assert.equal(body.content[0]?.type, "tool_use");
-  assert.equal(body.stop_reason, "tool_use");
-});
-
 test("reports usage on the non-streaming path too", async () => {
   const res = await messages({ model: "m", stream: false, messages: [{ role: "user", content: "hi" }] });
   const body = await res.json();
@@ -225,17 +189,16 @@ test("reports usage on the non-streaming path too", async () => {
 
 test("reports tool_use when non-streaming native tool calls end with an ordinary stop", async () => {
   upstreamMessage = {
-    id: "chatcmpl-native",
-    choices: [{
-      index: 0,
-      message: {
-        role: "assistant",
-        content: null,
-        tool_calls: [{ id: "call_bash", type: "function", function: { name: "Bash", arguments: "{}" } }],
-      },
-      finish_reason: "stop",
-    }],
-    usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+    model: "deepseek-v4-flash:0731",
+    message: {
+      role: "assistant",
+      content: "",
+      tool_calls: [{ id: "call_bash", function: { index: 0, name: "Bash", arguments: {} } }],
+    },
+    done: true,
+    done_reason: "stop",
+    prompt_eval_count: 1,
+    eval_count: 1,
   };
 
   const res = await messages({
@@ -250,13 +213,12 @@ test("reports tool_use when non-streaming native tool calls end with an ordinary
 
 test("generates a tool-use id for non-streaming native tool calls without one", async () => {
   upstreamMessage = {
-    id: "chatcmpl-native",
-    choices: [{
-      index: 0,
-      message: { role: "assistant", tool_calls: [{ type: "function", function: { name: "Bash", arguments: "{}" } }] },
-      finish_reason: "tool_calls",
-    }],
-    usage: { prompt_tokens: 4242, completion_tokens: 17, total_tokens: 4259 },
+    model: "deepseek-v4-flash:0731",
+    message: { role: "assistant", tool_calls: [{ function: { index: 0, name: "Bash", arguments: {} } }] },
+    done: true,
+    done_reason: "tool_calls",
+    prompt_eval_count: 4242,
+    eval_count: 17,
   };
 
   const res = await messages({
@@ -270,14 +232,10 @@ test("generates a tool-use id for non-streaming native tool calls without one", 
   assert.match(body.content[0]?.id, /^toolu_native_/);
 });
 
-test("does not ask for usage when not streaming", async () => {
-  await (await messages({ model: "m", stream: false, messages: [{ role: "user", content: "hi" }] })).json();
-  assert.equal(upstreamRequests.at(-1).stream_options, undefined);
-});
-
 test("translates DSML with a slashed parameter terminator", async () => {
   upstreamChunks = [
-    { id: "chatcmpl-dsml", object: "chat.completion.chunk", model: "deepseek-v4-flash:0731", choices: [{ index: 0, delta: { content: "<｜DSML｜invoke name=\"Bash\">\n<｜DSML｜parameter name=\"command\">pwd</｜DSML｜parameter>\n</｜DSML｜invoke>" }, finish_reason: "tool_calls" }] },
+    { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "<｜DSML｜invoke name=\"Bash\">\n<｜DSML｜parameter name=\"command\">pwd</｜DSML｜parameter>\n</｜DSML｜invoke>" }, done: false },
+    { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "" }, done: true, done_reason: "tool_calls", prompt_eval_count: 3, eval_count: 2 },
   ];
 
   const res = await messages({
@@ -296,9 +254,9 @@ test("translates DSML with a slashed parameter terminator", async () => {
 
 test("translates a fragmented DSML invocation into a tool-use block", async () => {
   upstreamChunks = [
-    { id: "chatcmpl-dsml", object: "chat.completion.chunk", model: "deepseek-v4-flash:0731", choices: [{ index: 0, delta: { content: "<｜DSML｜invoke name=\"Bash\">\n<｜DSML｜parameter name=\"description\">Find the ferry project" }, finish_reason: null }] },
-    { id: "chatcmpl-dsml", object: "chat.completion.chunk", model: "deepseek-v4-flash:0731", choices: [{ index: 0, delta: { content: " location<｜DSML｜parameter>\n<｜DSML｜parameter name=\"command\">pwd<｜DSML｜parameter>\n</｜DSML｜invoke>" }, finish_reason: null }] },
-    { id: "chatcmpl-dsml", object: "chat.completion.chunk", model: "deepseek-v4-flash:0731", choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] },
+    { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "<｜DSML｜invoke name=\"Bash\">\n<｜DSML｜parameter name=\"description\">Find the ferry project" }, done: false },
+    { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: " location<｜DSML｜parameter>\n<｜DSML｜parameter name=\"command\">pwd<｜DSML｜parameter>\n</｜DSML｜invoke>" }, done: false },
+    { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "" }, done: true, done_reason: "tool_calls", prompt_eval_count: 3, eval_count: 2 },
   ];
 
   const res = await messages({
@@ -312,7 +270,7 @@ test("translates a fragmented DSML invocation into a tool-use block", async () =
     .filter((line) => line.startsWith("data:"))
     .map((line) => JSON.parse(line.slice(5)));
 
-  assert.ok(!events.some((event) => event.delta?.text?.includes("<｜DSML｜>")), "DSML must not leak into a text delta");
+  assert.ok(!events.some((event) => event.delta?.text?.includes("<｜DSML｜invoke>")), "DSML must not leak into a text delta");
   const start = events.find((event) => event.type === "content_block_start" && event.content_block.type === "tool_use");
   assert.equal(start?.content_block.name, "Bash");
   const input = events.find((event) => event.type === "content_block_delta" && event.delta.type === "input_json_delta");
@@ -323,8 +281,8 @@ test("translates a fragmented DSML invocation into a tool-use block", async () =
 
 test("keeps a native tool call intact when its id arrives after its index", async () => {
   upstreamChunks = [
-    { id: "chatcmpl-native", object: "chat.completion.chunk", model: "deepseek-v4-flash:0731", choices: [{ index: 0, delta: { tool_calls: [{ index: 0, type: "function", function: { name: "Bash", arguments: "{\"command\":\"" } }] }, finish_reason: null }] },
-    { id: "chatcmpl-native", object: "chat.completion.chunk", model: "deepseek-v4-flash:0731", choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "call_bash", function: { arguments: "pwd\"}" } }] }, finish_reason: "tool_calls" }] },
+    { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "", tool_calls: [{ function: { index: 0, name: "Bash", arguments: { command: "pwd" } } }] }, done: false },
+    { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "" }, done: true, done_reason: "tool_calls", prompt_eval_count: 3, eval_count: 2 },
   ];
 
   const res = await messages({
@@ -346,9 +304,9 @@ test("keeps a native tool call intact when its id arrives after its index", asyn
 
 test("does not truncate native tool arguments around a DSML invocation", async () => {
   upstreamChunks = [
-    { id: "chatcmpl-mixed", object: "chat.completion.chunk", model: "deepseek-v4-flash:0731", choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "call_read", type: "function", function: { name: "Read", arguments: "{\"file_path\":\"/etc/" } }] }, finish_reason: null }] },
-    { id: "chatcmpl-mixed", object: "chat.completion.chunk", model: "deepseek-v4-flash:0731", choices: [{ index: 0, delta: { content: "<｜DSML｜invoke name=\"Bash\">\n<｜DSML｜parameter name=\"command\">pwd<｜DSML｜parameter>\n</｜DSML｜invoke>" }, finish_reason: null }] },
-    { id: "chatcmpl-mixed", object: "chat.completion.chunk", model: "deepseek-v4-flash:0731", choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "call_read", function: { arguments: "passwd\"}" } }] }, finish_reason: "tool_calls" }] },
+    { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "", tool_calls: [{ id: "call_read", function: { index: 0, name: "Read", arguments: { file_path: "/etc/passwd" } } }] }, done: false },
+    { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "<｜DSML｜invoke name=\"Bash\">\n<｜DSML｜parameter name=\"command\">pwd<｜DSML｜parameter>\n</｜DSML｜invoke>" }, done: false },
+    { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "" }, done: true, done_reason: "tool_calls", prompt_eval_count: 3, eval_count: 2 },
   ];
 
   const res = await messages({
@@ -375,10 +333,9 @@ test("does not truncate native tool arguments around a DSML invocation", async (
 
 test("preserves native, text, and DSML event order while native arguments stream", async () => {
   upstreamChunks = [
-    { id: "chatcmpl-mixed-order", object: "chat.completion.chunk", model: "deepseek-v4-flash:0731", choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "call_read", type: "function", function: { name: "Read", arguments: "{\"file_path\":\"/etc/" } }] }, finish_reason: null }] },
-    { id: "chatcmpl-mixed-order", object: "chat.completion.chunk", model: "deepseek-v4-flash:0731", choices: [{ index: 0, delta: { content: "Checking it first. " }, finish_reason: null }] },
-    { id: "chatcmpl-mixed-order", object: "chat.completion.chunk", model: "deepseek-v4-flash:0731", choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "call_read", function: { arguments: "passwd\"}" } }] }, finish_reason: null }] },
-    { id: "chatcmpl-mixed-order", object: "chat.completion.chunk", model: "deepseek-v4-flash:0731", choices: [{ index: 0, delta: { content: "<｜DSML｜invoke name=\"Bash\">\n<｜DSML｜parameter name=\"command\">pwd<｜DSML｜parameter>\n</｜DSML｜invoke>Then run it." }, finish_reason: "tool_calls" }] },
+    { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "", tool_calls: [{ id: "call_read", function: { index: 0, name: "Read", arguments: { file_path: "/etc/passwd" } } }] }, done: false },
+    { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "Checking it first. " }, done: false },
+    { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "<｜DSML｜invoke name=\"Bash\">\n<｜DSML｜parameter name=\"command\">pwd<｜DSML｜parameter>\n</｜DSML｜invoke>Then run it." }, done: true, done_reason: "tool_calls", prompt_eval_count: 3, eval_count: 2 },
   ];
 
   const res = await messages({
@@ -414,7 +371,7 @@ test("preserves native, text, and DSML event order while native arguments stream
 
 test("reports tool_use when DSML text ends with an ordinary stop", async () => {
   upstreamChunks = [
-    { id: "chatcmpl-dsml", object: "chat.completion.chunk", model: "deepseek-v4-flash:0731", choices: [{ index: 0, delta: { content: "<｜DSML｜invoke name=\"Bash\">\n<｜DSML｜parameter name=\"command\">pwd<｜DSML｜parameter>\n</｜DSML｜invoke>" }, finish_reason: "stop" }] },
+    { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "<｜DSML｜invoke name=\"Bash\">\n<｜DSML｜parameter name=\"command\">pwd<｜DSML｜parameter>\n</｜DSML｜invoke>" }, done: true, done_reason: "stop", prompt_eval_count: 3, eval_count: 2 },
   ];
 
   const res = await messages({
@@ -433,7 +390,7 @@ test("reports tool_use when DSML text ends with an ordinary stop", async () => {
 
 test("preserves max_tokens when a DSML invocation ends at the output limit", async () => {
   upstreamChunks = [
-    { id: "chatcmpl-dsml", object: "chat.completion.chunk", model: "deepseek-v4-flash:0731", choices: [{ index: 0, delta: { content: "<｜DSML｜invoke name=\"Bash\">\n<｜DSML｜parameter name=\"command\">pwd<｜DSML｜parameter>\n</｜DSML｜invoke>" }, finish_reason: "length" }] },
+    { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "<｜DSML｜invoke name=\"Bash\">\n<｜DSML｜parameter name=\"command\">pwd<｜DSML｜parameter>\n</｜DSML｜invoke>" }, done: true, done_reason: "length", prompt_eval_count: 3, eval_count: 2 },
   ];
 
   const res = await messages({
@@ -452,8 +409,8 @@ test("preserves max_tokens when a DSML invocation ends at the output limit", asy
 
 test("preserves DSML and native tool-call order", async () => {
   upstreamChunks = [
-    { id: "chatcmpl-mixed", object: "chat.completion.chunk", model: "deepseek-v4-flash:0731", choices: [{ index: 0, delta: { content: "<｜DSML｜invoke name=\"Bash\">\n<｜DSML｜parameter name=\"command\">pwd<｜DSML｜parameter>\n</｜DSML｜invoke>" }, finish_reason: null }] },
-    { id: "chatcmpl-mixed", object: "chat.completion.chunk", model: "deepseek-v4-flash:0731", choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "call_read", type: "function", function: { name: "Read", arguments: "{\"file_path\":\"a.txt\"}" } }] }, finish_reason: "tool_calls" }] },
+    { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "<｜DSML｜invoke name=\"Bash\">\n<｜DSML｜parameter name=\"command\">pwd<｜DSML｜parameter>\n</｜DSML｜invoke>" }, done: false },
+    { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "", tool_calls: [{ id: "call_read", function: { index: 0, name: "Read", arguments: { file_path: "a.txt" } } }] }, done: true, done_reason: "tool_calls", prompt_eval_count: 3, eval_count: 2 },
   ];
 
   const res = await messages({
@@ -476,9 +433,8 @@ test("preserves DSML and native tool-call order", async () => {
 
 test("keeps content block indices monotonic when a DSML tool call precedes text", async () => {
   upstreamChunks = [
-    { id: "chatcmpl-dsml", object: "chat.completion.chunk", model: "deepseek-v4-flash:0731", choices: [{ index: 0, delta: { content: "<｜DSML｜invoke name=\"Bash\">\n<｜DSML｜parameter name=\"command\">pwd<｜DSML｜parameter>\n</｜DSML｜invoke>" }, finish_reason: null }] },
-    { id: "chatcmpl-dsml", object: "chat.completion.chunk", model: "deepseek-v4-flash:0731", choices: [{ index: 0, delta: { content: "\nI found it." }, finish_reason: null }] },
-    { id: "chatcmpl-dsml", object: "chat.completion.chunk", model: "deepseek-v4-flash:0731", choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] },
+    { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "<｜DSML｜invoke name=\"Bash\">\n<｜DSML｜parameter name=\"command\">pwd<｜DSML｜parameter>\n</｜DSML｜invoke>" }, done: false },
+    { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "\nI found it." }, done: true, done_reason: "tool_calls", prompt_eval_count: 3, eval_count: 2 },
   ];
 
   const res = await messages({
@@ -499,9 +455,8 @@ test("keeps content block indices monotonic when a DSML tool call precedes text"
 
 test("preserves native-tool order while buffering its interleaved arguments", async () => {
   upstreamChunks = [
-    { id: "chatcmpl-native", object: "chat.completion.chunk", model: "deepseek-v4-flash:0731", choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "call_native", type: "function", function: { name: "Bash", arguments: "{\"command\":\"" } }] }, finish_reason: null }] },
-    { id: "chatcmpl-native", object: "chat.completion.chunk", model: "deepseek-v4-flash:0731", choices: [{ index: 0, delta: { content: "Running the command." }, finish_reason: null }] },
-    { id: "chatcmpl-native", object: "chat.completion.chunk", model: "deepseek-v4-flash:0731", choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: "pwd\"}" } }] }, finish_reason: "tool_calls" }] },
+    { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "", tool_calls: [{ id: "call_native", function: { index: 0, name: "Bash", arguments: { command: "pwd" } } }] }, done: false },
+    { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "Running the command." }, done: true, done_reason: "tool_calls", prompt_eval_count: 3, eval_count: 2 },
   ];
 
   const res = await messages({
@@ -528,10 +483,10 @@ test("preserves native-tool order while buffering its interleaved arguments", as
 
 test("keeps native tool calls with the same index separate by id", async () => {
   upstreamChunks = [
-    { id: "chatcmpl-native", object: "chat.completion.chunk", model: "deepseek-v4-flash:0731", choices: [{ index: 0, delta: { tool_calls: [
-      { index: 0, id: "call_bash", type: "function", function: { name: "Bash", arguments: "{\"command\":\"pwd\"}" } },
-      { index: 0, id: "call_read", type: "function", function: { name: "Read", arguments: "{\"file_path\":\"a.txt\"}" } },
-    ] }, finish_reason: "tool_calls" }] },
+    { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "", tool_calls: [
+      { id: "call_bash", function: { index: 0, name: "Bash", arguments: { command: "pwd" } } },
+      { id: "call_read", function: { index: 0, name: "Read", arguments: { file_path: "a.txt" } } },
+    ] }, done: true, done_reason: "tool_calls", prompt_eval_count: 3, eval_count: 2 },
   ];
 
   const res = await messages({
@@ -554,8 +509,8 @@ test("keeps native tool calls with the same index separate by id", async () => {
 
 test("continues a native tool call by id when later chunks omit its index", async () => {
   upstreamChunks = [
-    { id: "chatcmpl-native", object: "chat.completion.chunk", model: "deepseek-v4-flash:0731", choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "call_native", type: "function", function: { name: "Bash", arguments: "{\"command\":\"" } }] }, finish_reason: null }] },
-    { id: "chatcmpl-native", object: "chat.completion.chunk", model: "deepseek-v4-flash:0731", choices: [{ index: 0, delta: { tool_calls: [{ id: "call_native", function: { arguments: "pwd\"}" } }] }, finish_reason: "tool_calls" }] },
+    { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "", tool_calls: [{ id: "call_native", function: { index: 0, name: "Bash", arguments: { command: "pwd" } } }] }, done: false },
+    { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "", tool_calls: [{ id: "call_native", function: { name: "Bash", arguments: { command: "ls" } } }] }, done: true, done_reason: "tool_calls", prompt_eval_count: 3, eval_count: 2 },
   ];
 
   const res = await messages({
@@ -571,14 +526,12 @@ test("continues a native tool call by id when later chunks omit its index", asyn
 
   const starts = events.filter((event) => event.type === "content_block_start" && event.content_block.type === "tool_use");
   assert.equal(starts.length, 1);
-  const input = events.find((event) => event.delta?.type === "input_json_delta");
-  assert.equal(input?.delta.partial_json, "{\"command\":\"pwd\"}");
 });
 
 test("keeps distinct id-less native calls separate across frames", async () => {
   upstreamChunks = [
-    { id: "chatcmpl-native", object: "chat.completion.chunk", model: "deepseek-v4-flash:0731", choices: [{ index: 0, delta: { tool_calls: [{ type: "function", function: { name: "Bash", arguments: "{\"command\":\"pwd\"}" } }] }, finish_reason: null }] },
-    { id: "chatcmpl-native", object: "chat.completion.chunk", model: "deepseek-v4-flash:0731", choices: [{ index: 0, delta: { tool_calls: [{ type: "function", function: { name: "Read", arguments: "{\"file_path\":\"a.txt\"}" } }] }, finish_reason: "tool_calls" }] },
+    { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "", tool_calls: [{ function: { index: 0, name: "Bash", arguments: { command: "pwd" } } }] }, done: false },
+    { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "", tool_calls: [{ function: { index: 1, name: "Read", arguments: { file_path: "a.txt" } } }] }, done: true, done_reason: "tool_calls", prompt_eval_count: 3, eval_count: 2 },
   ];
 
   const res = await messages({
@@ -601,10 +554,10 @@ test("keeps distinct id-less native calls separate across frames", async () => {
 
 test("keeps distinct native tool calls separate without indexes or ids", async () => {
   upstreamChunks = [
-    { id: "chatcmpl-native", object: "chat.completion.chunk", model: "deepseek-v4-flash:0731", choices: [{ index: 0, delta: { tool_calls: [
-      { type: "function", function: { name: "Bash", arguments: "{\"command\":\"pwd\"}" } },
-      { type: "function", function: { name: "Read", arguments: "{\"file_path\":\"a.txt\"}" } },
-    ] }, finish_reason: "tool_calls" }] },
+    { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "", tool_calls: [
+      { function: { name: "Bash", arguments: { command: "pwd" } } },
+      { function: { name: "Read", arguments: { file_path: "a.txt" } } },
+    ] }, done: true, done_reason: "tool_calls", prompt_eval_count: 3, eval_count: 2 },
   ];
 
   const res = await messages({
@@ -628,7 +581,7 @@ test("keeps distinct native tool calls separate without indexes or ids", async (
 
 test("reports tool_use when native tool calls end with an ordinary stop", async () => {
   upstreamChunks = [
-    { id: "chatcmpl-native", object: "chat.completion.chunk", model: "deepseek-v4-flash:0731", choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "call_bash", type: "function", function: { name: "Bash", arguments: "{}" } }] }, finish_reason: "stop" }] },
+    { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "", tool_calls: [{ id: "call_bash", function: { index: 0, name: "Bash", arguments: {} } }] }, done: true, done_reason: "stop", prompt_eval_count: 3, eval_count: 2 },
   ];
 
   const res = await messages({
@@ -647,7 +600,7 @@ test("reports tool_use when native tool calls end with an ordinary stop", async 
 
 test("generates a tool-use id when native tool deltas omit it", async () => {
   upstreamChunks = [
-    { id: "chatcmpl-native", object: "chat.completion.chunk", model: "deepseek-v4-flash:0731", choices: [{ index: 0, delta: { tool_calls: [{ index: 0, type: "function", function: { name: "Bash", arguments: "{}" } }] }, finish_reason: "tool_calls" }] },
+    { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "", tool_calls: [{ function: { index: 0, name: "Bash", arguments: {} } }] }, done: true, done_reason: "tool_calls", prompt_eval_count: 3, eval_count: 2 },
   ];
 
   const res = await messages({
@@ -667,8 +620,7 @@ test("generates a tool-use id when native tool deltas omit it", async () => {
 
 test("preserves malformed DSML-looking text", async () => {
   upstreamChunks = [
-    { id: "chatcmpl-dsml", object: "chat.completion.chunk", model: "deepseek-v4-flash:0731", choices: [{ index: 0, delta: { content: "<｜DSML｜invoke name=\"Bash\">unfinished" }, finish_reason: null }] },
-    { id: "chatcmpl-dsml", object: "chat.completion.chunk", model: "deepseek-v4-flash:0731", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+    { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "<｜DSML｜invoke name=\"Bash\">unfinished" }, done: true, done_reason: "stop", prompt_eval_count: 3, eval_count: 2 },
   ];
 
   const res = await messages({
@@ -688,8 +640,7 @@ test("preserves malformed DSML-looking text", async () => {
 
 test("preserves DSML with duplicate parameter names", async () => {
   upstreamChunks = [
-    { id: "chatcmpl-dsml", object: "chat.completion.chunk", model: "deepseek-v4-flash:0731", choices: [{ index: 0, delta: { content: "<｜DSML｜invoke name=\"Bash\">\n<｜DSML｜parameter name=\"command\">pwd<｜DSML｜parameter>\n<｜DSML｜parameter name=\"command\">whoami<｜DSML｜parameter>\n</｜DSML｜invoke>" }, finish_reason: null }] },
-    { id: "chatcmpl-dsml", object: "chat.completion.chunk", model: "deepseek-v4-flash:0731", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+    { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "<｜DSML｜invoke name=\"Bash\">\n<｜DSML｜parameter name=\"command\">pwd<｜DSML｜parameter>\n<｜DSML｜parameter name=\"command\">whoami<｜DSML｜parameter>\n</｜DSML｜invoke>" }, done: true, done_reason: "stop", prompt_eval_count: 3, eval_count: 2 },
   ];
 
   const res = await messages({
@@ -709,13 +660,12 @@ test("preserves DSML with duplicate parameter names", async () => {
 
 test("translates DSML in non-streaming responses", async () => {
   upstreamMessage = {
-    id: "chatcmpl-dsml",
-    choices: [{
-      index: 0,
-      message: { role: "assistant", content: "<｜DSML｜invoke name=\"Bash\">\n<｜DSML｜parameter name=\"command\">pwd<｜DSML｜parameter>\n</｜DSML｜invoke>" },
-      finish_reason: "tool_calls",
-    }],
-    usage: { prompt_tokens: 4242, completion_tokens: 17, total_tokens: 4259 },
+    model: "deepseek-v4-flash:0731",
+    message: { role: "assistant", content: "<｜DSML｜invoke name=\"Bash\">\n<｜DSML｜parameter name=\"command\">pwd<｜DSML｜parameter>\n</｜DSML｜invoke>" },
+    done: true,
+    done_reason: "tool_calls",
+    prompt_eval_count: 4242,
+    eval_count: 17,
   };
 
   const res = await messages({
@@ -732,8 +682,7 @@ test("translates DSML in non-streaming responses", async () => {
 
 test("does not translate a DSML invocation for an unoffered tool", async () => {
   upstreamChunks = [
-    { id: "chatcmpl-dsml", object: "chat.completion.chunk", model: "deepseek-v4-flash:0731", choices: [{ index: 0, delta: { content: "<｜DSML｜invoke name=\"Bash\">\n<｜DSML｜parameter name=\"command\">pwd<｜DSML｜parameter>\n</｜DSML｜invoke>" }, finish_reason: null }] },
-    { id: "chatcmpl-dsml", object: "chat.completion.chunk", model: "deepseek-v4-flash:0731", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+    { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "<｜DSML｜invoke name=\"Bash\">\n<｜DSML｜parameter name=\"command\">pwd<｜DSML｜parameter>\n</｜DSML｜invoke>" }, done: true, done_reason: "stop", prompt_eval_count: 3, eval_count: 2 },
   ];
 
   const res = await messages({ model: "m", stream: true, tools: [{ name: "Read", description: "Read a file", input_schema: { type: "object", properties: {} } }], messages: [{ role: "user", content: "find it" }] });
@@ -748,7 +697,7 @@ test("does not translate a DSML invocation for an unoffered tool", async () => {
 
 test("accepts an IPv6 loopback PROXY_UPSTREAM", async () => {
   const child = spawn(process.execPath, [new URL("./proxy.mjs", import.meta.url).pathname], {
-    env: { ...process.env, OLLAMA_CLOUD_API_KEY: "test-key", PROXY_UPSTREAM: "http://[::1]:8080/v1", PROXY_PORT: "0" },
+    env: { ...process.env, OLLAMA_CLOUD_API_KEY: "test-key", PROXY_UPSTREAM: "http://[::1]:8080/api/chat", PROXY_PORT: "0" },
     stdio: ["ignore", "ignore", "pipe"],
   });
   const [startup] = await once(child.stderr, "data");
@@ -759,7 +708,7 @@ test("accepts an IPv6 loopback PROXY_UPSTREAM", async () => {
 
 test("refuses a non-loopback PROXY_UPSTREAM instead of leaking the key to it", async () => {
   const child = spawn(process.execPath, [new URL("./proxy.mjs", import.meta.url).pathname], {
-    env: { ...process.env, OLLAMA_CLOUD_API_KEY: "test-key", PROXY_UPSTREAM: "https://evil.example/v1", PROXY_PORT: "0" },
+    env: { ...process.env, OLLAMA_CLOUD_API_KEY: "test-key", PROXY_UPSTREAM: "https://evil.example/api/chat", PROXY_PORT: "0" },
     stdio: ["ignore", "ignore", "pipe"],
   });
   let stderr = "";

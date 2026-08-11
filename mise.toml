@@ -1,0 +1,52 @@
+[tools]
+# Pinned to the runtime the systemd unit already launches this proxy with.
+node = "26.5.1"
+
+[tasks.anthropic]
+description = "Run the Ollama->Anthropic proxy in the foreground (Anthropic Messages for Claude Code)"
+run = "node ollama-anthropic/proxy.mjs"
+
+[tasks.health]
+description = "Check the proxy /healthz endpoint"
+run = '''
+#!/usr/bin/env bash
+set -uo pipefail
+printf '%s: ' "${PROXY_PORT:-3445}"
+curl -fsS --max-time 3 "http://127.0.0.1:${PROXY_PORT:-3445}/healthz" || echo "not responding"
+echo
+'''
+
+[tasks.install]
+description = "Install the proxy as a systemd --user service pointing at this checkout"
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]:-$PWD}")" && pwd)"
+UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+NODE="$(command -v node)"
+mkdir -p "$UNIT_DIR"
+
+cat > "$UNIT_DIR/ollama-anthropic-proxy.service" <<UNIT
+[Unit]
+Description=Ollama Cloud -> Anthropic Messages proxy for Claude Code
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=$NODE $REPO/ollama-anthropic/proxy.mjs
+Restart=on-failure
+RestartSec=3
+EnvironmentFile=${XDG_CONFIG_HOME:-$HOME/.config}/ollama-anthropic-proxy/env
+Environment=PROXY_PORT=3445
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
+UNIT
+echo "wrote $UNIT_DIR/ollama-anthropic-proxy.service"
+
+systemctl --user daemon-reload
+echo "Now: systemctl --user enable --now ollama-anthropic-proxy"
+'''
