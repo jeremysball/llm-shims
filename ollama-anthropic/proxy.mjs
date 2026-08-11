@@ -1,17 +1,23 @@
 #!/usr/bin/env node
 // ollama-anthropic-proxy: presents the Anthropic Messages API to Claude Code,
-// translates to the OpenAI Chat Completions API, forwards to Ollama Cloud
-// with a static API key, and translates the SSE stream back to Anthropic shape.
+// translates to Ollama's native /api/chat, forwards to Ollama Cloud with a
+// static API key, and translates the NDJSON stream back to Anthropic shape.
 //
-// Verified wire details (this session):
-//   UPSTREAM: POST https://ollama.com/v1/chat/completions
+// Why native instead of the OpenAI-compatible /v1/chat/completions endpoint:
+// only the native /api/chat honours the `think` switch on Ollama Cloud. The
+// OpenAI-compatible endpoint silently ignores every think spelling (verified
+// 2026-08-08 against deepseek-v4-flash:0731), so it cannot force thinking off.
+//
+// Verified wire details (this session, against ollama.com):
+//   UPSTREAM: POST https://ollama.com/api/chat
 //     headers: Authorization: Bearer <OLLAMA_CLOUD_API_KEY>
-//     body:    {model, messages, stream, stream_options, tools} — standard
-//     OpenAI chat-completions shape
-//     streaming tool calls confirmed via curl: delta.tool_calls[].function.{name,arguments}
-//     arrive incrementally, keyed by index or id when available.
-//     token usage only arrives if stream_options.include_usage is asked for,
-//     and then only in a final chunk that carries an empty choices array.
+//     body:    {model, messages, stream, think, tools} — native chat shape
+//     streaming is newline-delimited JSON (one JSON object per line), not SSE.
+//     `think` is honoured (false -> 0 chars of thinking).
+//     token usage arrives only in the terminal frame (done:true) as
+//     prompt_eval_count / eval_count.
+//     tool calls arrive whole in a single frame's message.tool_calls, with
+//     `arguments` as a JSON object (not an incrementally-streamed string).
 
 import http from "node:http";
 
@@ -22,7 +28,7 @@ import http from "node:http";
 const UPSTREAM = resolveUpstream(process.env.PROXY_UPSTREAM);
 
 function resolveUpstream(override) {
-  if (!override) return "https://ollama.com/v1/chat/completions";
+  if (!override) return "https://ollama.com/api/chat";
   let host;
   try {
     host = new URL(override).hostname;
@@ -39,13 +45,16 @@ function resolveUpstream(override) {
 const PORT = Number(process.env.PROXY_PORT || 3445);
 const API_KEY = process.env.OLLAMA_CLOUD_API_KEY;
 const MODEL = process.env.PROXY_MODEL || "deepseek-v4-flash:0731";
+// PROXY_THINK=true passes the model's thinking through; the default (false)
+// forces it off. Only the native endpoint can do this on Ollama Cloud.
+const THINK = process.env.PROXY_THINK === "true";
 
 if (!API_KEY) {
   console.error("OLLAMA_CLOUD_API_KEY is not set in the environment");
   process.exit(1);
 }
 
-// ---------- Anthropic Messages -> OpenAI Chat Completions request translation ----------
+// ---------- Anthropic Messages -> native /api/chat request translation ----------
 function translateSystem(system) {
   if (!system) return null;
   if (typeof system === "string") return system;
@@ -55,6 +64,10 @@ function translateSystem(system) {
   return null;
 }
 
+// Translates Anthropic messages to native ChatMessage objects. Native bundles
+// tool calls into the assistant message that produced them, so a tool_use block
+// is folded onto the previous assistant message's tool_calls array; a
+// tool_result block becomes its own role:"tool" message.
 function translateMessages(anth) {
   const out = [];
   const sys = translateSystem(anth.system);
@@ -70,13 +83,25 @@ function translateMessages(anth) {
     }
     if (!Array.isArray(content)) continue;
 
+    let last = out[out.length - 1];
     const textParts = [];
-    const toolCalls = [];
     for (const block of content) {
       if (block.type === "text") {
         textParts.push(block.text);
       } else if (block.type === "tool_use") {
-        toolCalls.push({
+        // Fold onto the previous assistant message if present; native requires
+        // tool_calls on an assistant message. Otherwise synthesize one.
+        let target = null;
+        if (last && last.role === "assistant" && Array.isArray(last.tool_calls)) {
+          target = last;
+        }
+        if (!target) {
+          target = { role: "assistant", content: null, tool_calls: [] };
+          out.push(target);
+          last = target;
+        }
+        target.tool_calls = target.tool_calls || [];
+        target.tool_calls.push({
           id: block.id,
           type: "function",
           function: {
@@ -90,14 +115,17 @@ function translateMessages(anth) {
           : typeof block.content === "string"
             ? block.content
             : JSON.stringify(block.content ?? "");
-        out.push({ role: "tool", tool_call_id: block.tool_use_id, content: out2 });
+        out.push({ role: "tool", content: out2 });
       }
-      // "thinking" blocks: Ollama Cloud has no equivalent input slot; skip.
+      // "thinking" blocks: with think=false none arrive; on passthrough they
+      // would ride in message.thinking on the native side, not as content.
     }
-    if (toolCalls.length) {
-      out.push({ role: "assistant", content: textParts.join("") || null, tool_calls: toolCalls });
-    } else if (textParts.length) {
-      out.push({ role, content: textParts.join("") });
+    if (textParts.length) {
+      if (last && last.role === "assistant" && Array.isArray(last.tool_calls) && !last.content) {
+        last.content = textParts.join("");
+      } else {
+        out.push({ role, content: textParts.join("") });
+      }
     }
   }
   return out;
@@ -121,18 +149,13 @@ function buildChatRequest(anth) {
     messages: translateMessages(anth),
     stream: anth.stream !== false,
   };
-  // Without this, Ollama Cloud streams no usage at all and every turn is
-  // reported to Claude Code as costing zero tokens, which leaves the
-  // statusline's context gauge permanently blank. Verified against
-  // ollama.com: absent include_usage, no chunk in the stream carries a usage
-  // object; present, a final chunk does.
-  if (req.stream) req.stream_options = { include_usage: true };
+  req.think = THINK;
   const tools = translateTools(anth.tools);
   if (tools) req.tools = tools;
   return req;
 }
 
-// ---------- OpenAI chat-completions SSE -> Anthropic SSE translation ----------
+// ---------- native /api/chat NDJSON -> Anthropic SSE translation ----------
 function sse(obj) {
   return `event: ${obj.type}\ndata: ${JSON.stringify(obj)}\n\n`;
 }
@@ -140,16 +163,16 @@ function sse(obj) {
 const FINISH_TO_STOP_REASON = { tool_calls: "tool_use", length: "max_tokens", stop: "end_turn" };
 
 function createDsmlDecoder(offeredToolNames) {
-  const open = "<｜DSML｜invoke name=\"";
-  const close = "</｜DSML｜invoke>";
+  const open = "<invoke name=\"";
+  const close = "</invoke>";
   let buffer = "";
 
   function parseInvocation(source) {
-    const match = source.match(/^<｜DSML｜invoke name="([^"]+)">\n([\s\S]*)<\/｜DSML｜invoke>$/);
+    const match = source.match(/^<invoke name="([^"]+)">\n([\s\S]*)<\/invoke>$/);
     if (!match || !offeredToolNames.has(match[1])) return null;
 
     const input = {};
-    const parameter = /<｜DSML｜parameter name="([^"]+)">([\s\S]*?)(?:<｜DSML｜parameter>|<\/｜DSML｜parameter>)/g;
+    const parameter = /<parameter name="([^"]+)">([\s\S]*?)(?:<parameter>|<\/parameter>)/g;
     let offset = 0;
     for (let item; (item = parameter.exec(match[2])); ) {
       if (match[2].slice(offset, item.index).trim() || Object.hasOwn(input, item[1])) return null;
@@ -224,9 +247,9 @@ async function streamTranslated(upstreamRes, reply, clientModel, reqId, offeredT
   reply.write(sse({ type: "ping" }));
 
   let textBlock = null;
-  // A native OpenAI tool-call delta may resume after any later content delta.
-  // Anthropic blocks cannot receive deltas after their stop event, so defer
-  // events only after the first native tool call; ordinary text still streams.
+  // A native tool call may be interleaved with later content deltas. Anthropic
+  // blocks cannot receive deltas after their stop event, so defer events after
+  // the first native tool call; ordinary text still streams.
   let deferContent = false;
   const toolBlocksByKey = new Map();
   const deferredEvents = [];
@@ -235,7 +258,6 @@ async function streamTranslated(upstreamRes, reply, clientModel, reqId, offeredT
   let nextBlockIndex = 0;
   let stopReason = "end_turn";
   let usage = { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 };
-  let buffer = "";
   const dsml = createDsmlDecoder(offeredToolNames);
 
   const closeTextBlock = () => {
@@ -303,30 +325,30 @@ async function streamTranslated(upstreamRes, reply, clientModel, reqId, offeredT
     }
   };
 
+  // A native /api/chat frame is a single JSON object per line (NDJSON), unlike
+  // the OpenAI SSE frames this proxy previously translated. The final frame has
+  // done:true and carries the usage stats.
   const processFrame = (frame) => {
-    let dataLine = "";
-    for (const ln of frame.split("\n")) if (ln.startsWith("data:")) dataLine += ln.slice(5).trim();
-    if (!dataLine || dataLine === "[DONE]") return;
+    if (!frame.trim()) return;
     let ev;
-    try { ev = JSON.parse(dataLine); } catch { return; }
+    try { ev = JSON.parse(frame); } catch { return; }
 
-    if (ev.usage) {
+    if (ev.done && typeof ev.prompt_eval_count === "number") {
       usage = {
-        input_tokens: ev.usage.prompt_tokens || 0,
-        output_tokens: ev.usage.completion_tokens || 0,
+        input_tokens: ev.prompt_eval_count || 0,
+        output_tokens: ev.eval_count || 0,
         cache_creation_input_tokens: 0,
         cache_read_input_tokens: 0,
       };
     }
 
-    const choice = ev.choices?.[0];
-    if (!choice) return;
-    const delta = choice.delta || {};
-    if (delta.content) emitDsmlParts(dsml.push(delta.content));
-    if (Array.isArray(delta.tool_calls)) {
-      for (const tc of delta.tool_calls) {
-        const indexKey = tc.index === undefined ? null : `index:${tc.index}`;
+    const msg = ev.message || {};
+    if (msg.content) emitDsmlParts(dsml.push(msg.content));
+
+    if (Array.isArray(msg.tool_calls)) {
+      for (const tc of msg.tool_calls) {
         const idKey = tc.id ? `id:${tc.id}` : null;
+        const indexKey = tc.function?.index === undefined ? null : `index:${tc.function.index}`;
         const indexedBlock = indexKey ? toolBlocksByKey.get(indexKey) : null;
         let block = idKey ? toolBlocksByKey.get(idKey) : null;
         if (!block && indexedBlock && (!tc.id || indexedBlock.contentBlock.id.startsWith("toolu_native_"))) {
@@ -348,34 +370,47 @@ async function streamTranslated(upstreamRes, reply, clientModel, reqId, offeredT
         if (idKey) toolBlocksByKey.set(idKey, block);
         if (tc.id && block.contentBlock.id.startsWith("toolu_native_")) block.contentBlock.id = tc.id;
         if (tc.function?.name) block.contentBlock.name = tc.function.name;
-        if (tc.function?.arguments) block.arguments += tc.function.arguments;
+        if (tc.function?.arguments) {
+          const args = typeof tc.function.arguments === "string"
+            ? tc.function.arguments
+            : JSON.stringify(tc.function.arguments);
+          block.arguments += args;
+        }
       }
     }
-    if (choice.finish_reason) {
-      const upstreamStopReason = FINISH_TO_STOP_REASON[choice.finish_reason] || "end_turn";
-      stopReason = upstreamStopReason === "end_turn" && emittedToolUse ? "tool_use" : upstreamStopReason;
+    if (ev.done) {
+      stopReason = FINISH_TO_STOP_REASON[ev.done_reason] || "end_turn";
+      stopReason = stopReason === "end_turn" && emittedToolUse ? "tool_use" : stopReason;
     }
   };
 
   const reader = upstreamRes.body.getReader();
   const dec = new TextDecoder();
-  let idx;
+  let buffer = "";
+  let frameStart = 0;
+  let frameEnd;
+  while ((frameEnd = buffer.indexOf("\n")) >= 0) {
+    processFrame(buffer.slice(frameStart, frameEnd));
+    buffer = buffer.slice(frameEnd + 1);
+  }
   for (;;) {
     const { done, value } = await reader.read();
     if (done) break;
     buffer += dec.decode(value, { stream: true });
-    while ((idx = buffer.indexOf("\n\n")) >= 0) {
+    let idx;
+    while ((idx = buffer.indexOf("\n")) >= 0) {
       const frame = buffer.slice(0, idx);
-      buffer = buffer.slice(idx + 2);
+      buffer = buffer.slice(idx + 1);
       processFrame(frame);
     }
   }
   buffer += dec.decode();
-  while ((idx = buffer.indexOf("\n\n")) >= 0) {
-    const frame = buffer.slice(0, idx);
-    buffer = buffer.slice(idx + 2);
-    processFrame(frame);
+  while ((frameEnd = buffer.indexOf("\n")) >= 0) {
+    processFrame(buffer.slice(0, frameEnd));
+    buffer = buffer.slice(frameEnd + 1);
   }
+  if (buffer.trim()) processFrame(buffer);
+
   emitDsmlParts(dsml.finish());
   emitDeferredEvents();
   closeTextBlock();
@@ -386,7 +421,7 @@ async function streamTranslated(upstreamRes, reply, clientModel, reqId, offeredT
 
 async function bufferTranslated(upstreamRes, reply, clientModel, reqId, offeredToolNames) {
   const json = await upstreamRes.json();
-  const msg = json.choices?.[0]?.message || {};
+  const msg = json.message || {};
   const content = [];
   let dsmlToolUse = false;
   if (msg.content) {
@@ -406,16 +441,16 @@ async function bufferTranslated(upstreamRes, reply, clientModel, reqId, offeredT
   }
   for (const tc of msg.tool_calls || []) {
     let input = {};
-    try { input = JSON.parse(tc.function.arguments); } catch {}
-    content.push({ type: "tool_use", id: tc.id || `toolu_native_${Math.random().toString(36).slice(2, 12)}`, name: tc.function.name, input });
+    try { input = typeof tc.function?.arguments === "string" ? JSON.parse(tc.function.arguments) : tc.function?.arguments || {}; } catch {}
+    content.push({ type: "tool_use", id: tc.id || `toolu_native_${Math.random().toString(36).slice(2, 12)}`, name: tc.function?.name, input });
   }
-  const upstreamStopReason = FINISH_TO_STOP_REASON[json.choices?.[0]?.finish_reason] || "end_turn";
+  const upstreamStopReason = FINISH_TO_STOP_REASON[json.done_reason] || "end_turn";
   const stopReason = upstreamStopReason === "end_turn" && (dsmlToolUse || msg.tool_calls?.length)
     ? "tool_use"
     : upstreamStopReason;
   const usage = {
-    input_tokens: json.usage?.prompt_tokens || 0,
-    output_tokens: json.usage?.completion_tokens || 0,
+    input_tokens: json.prompt_eval_count || 0,
+    output_tokens: json.eval_count || 0,
     cache_creation_input_tokens: 0,
     cache_read_input_tokens: 0,
   };
@@ -473,7 +508,7 @@ const server = http.createServer(async (req, reply) => {
   }
   if (method === "GET" && path === "/healthz") {
     reply.writeHead(200, { "Content-Type": "application/json" });
-    reply.end(isHead ? "" : JSON.stringify({ ok: true, model: MODEL, hasKey: !!API_KEY }));
+    reply.end(isHead ? "" : JSON.stringify({ ok: true, model: MODEL, think: THINK, hasKey: !!API_KEY }));
     return;
   }
   if (method === "GET" && (path === "/v1/models" || path === "/models")) {
