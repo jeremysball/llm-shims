@@ -1,0 +1,54 @@
+#!/bin/sh
+# llm-shims pre-commit hook: syntax-check + lint + typecheck staged JavaScript.
+#
+# 1. `node --check` parses every staged .mjs (catches malformed syntax before
+#    it ever reaches a review or CI).
+# 2. ESLint catches what parsing can't -- undefined vars (no-undef), unsafe
+#    finally blocks, discarded caught errors, etc. Warnings inform; only
+#    errors block the commit.
+# 3. `tsc --noEmit` type-checks ollama-anthropic/proxy.mjs and
+#    proxy.test.mjs (see tsconfig.json) against their JSDoc annotations.
+#
+# Bypass in a pinch with `git commit --no-verify`.
+
+# Staged, non-deleted .mjs files (newline-safe enough for this repo's paths).
+files=$(git diff --cached --name-only --diff-filter=ACM -- '*.mjs')
+[ -z "$files" ] && exit 0
+
+fail=0
+
+# --- 1. parse check (validates the STAGED content) ---
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+repo="$(git rev-parse --show-toplevel)"
+for f in $files; do
+  blob="$tmp/$(printf '%s' "$f" | tr '/' '_')"
+  git show ":$f" > "$blob" 2>/dev/null || continue
+  if ! err="$(node --check "$blob" 2>&1)"; then
+    echo "✗ $f — JavaScript parse error:"
+    printf '%s\n' "$err" | sed "s#$blob#$f#g"
+    fail=1
+  fi
+done
+
+# --- 2. eslint / tsc (the complete staged tree, not working-tree files) ---
+if [ -x "$repo/node_modules/.bin/eslint" ]; then
+  mkdir -p "$tmp/tree"
+  git checkout-index --all --prefix="$tmp/tree/"
+  ln -s "$repo/node_modules" "$tmp/tree/node_modules"
+  if ! (
+    cd "$tmp/tree" || exit 1
+    ./node_modules/.bin/eslint . && ./node_modules/.bin/tsc --noEmit
+  ); then
+    fail=1
+  fi
+else
+  echo "⚠ eslint and typescript are not installed — run 'npm install' to enable quality checks."
+fi
+
+if [ "$fail" -ne 0 ]; then
+  echo
+  echo "Commit blocked by pre-commit: fix the error(s) above."
+  echo "(Run \`npm run check\` for the full repo; \`git commit --no-verify\` to bypass.)"
+  exit 1
+fi

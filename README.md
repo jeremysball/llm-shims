@@ -31,6 +31,7 @@ environment.
 git clone https://github.com/jeremysball/llm-shims.git
 cd llm-shims
 mise install                          # node, pinned
+npm install                           # dev tooling (eslint, typescript) + wires the pre-commit hook
 mise run ollama-anthropic-install     # write the systemd --user unit for this checkout
 systemctl --user enable --now ollama-anthropic-proxy
 mise run ollama-anthropic-health      # /healthz
