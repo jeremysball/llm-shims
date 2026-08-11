@@ -232,6 +232,34 @@ test("generates a tool-use id for non-streaming native tool calls without one", 
   assert.match(body.content[0]?.id, /^toolu_native_/);
 });
 
+// Reproduces a live 400 from Ollama Cloud: "Value looks like object, but
+// can't find closing '}' symbol". Native /api/chat rejects a prior turn's
+// tool_calls[].function.arguments when it arrives as a JSON-encoded string
+// instead of a real object -- confirmed by replaying a captured request
+// directly against ollama.com on 2026-08-10.
+test("sends a prior tool_use turn's arguments upstream as an object, not a JSON string", async () => {
+  await messages({
+    model: "m",
+    stream: true,
+    tools: [{ name: "Bash", description: "Run a command", input_schema: { type: "object", properties: {} } }],
+    messages: [
+      { role: "user", content: "find it" },
+      {
+        role: "assistant",
+        content: [{ type: "tool_use", id: "call_bash", name: "Bash", input: { command: "pwd" } }],
+      },
+      {
+        role: "user",
+        content: [{ type: "tool_result", tool_use_id: "call_bash", content: "/tmp" }],
+      },
+      { role: "user", content: "now what" },
+    ],
+  });
+
+  const sent = upstreamRequests.at(-1).messages.find((m) => m.role === "assistant" && m.tool_calls);
+  assert.deepEqual(sent.tool_calls[0].function.arguments, { command: "pwd" });
+});
+
 test("translates DSML with a slashed parameter terminator", async () => {
   upstreamChunks = [
     { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "<｜DSML｜invoke name=\"Bash\">\n<｜DSML｜parameter name=\"command\">pwd</｜DSML｜parameter>\n</｜DSML｜invoke>" }, done: false },
