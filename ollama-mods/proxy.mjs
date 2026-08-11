@@ -53,7 +53,14 @@ const PORT = Number(process.env.PROXY_PORT || 3446);
 const API_KEY = process.env.OLLAMA_CLOUD_API_KEY;
 
 // The reason this proxy exists. Set PROXY_THINK=true to pass thinking through.
-const THINK = process.env.PROXY_THINK === "true";
+// `true`, `1`, `on`, and `yes` all mean on (any case), so the same env value
+// means the same thing here as it does in ollama-anthropic -- only the default
+// differs (off here, on there, since mods renders thinking natively).
+const THINK = isTruthy(process.env.PROXY_THINK);
+
+function isTruthy(value) {
+  return /^(true|1|on|yes)$/i.test((value ?? "").trim());
+}
 
 if (!API_KEY) {
   console.error("OLLAMA_CLOUD_API_KEY is not set in the environment");

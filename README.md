@@ -12,9 +12,10 @@ another small proxy, not adding a branch to a growing multi-backend server.
 | [`ollama-mods`](ollama-mods/) | 127.0.0.1:3446 | Ollama native | `ollama.com/api/chat` |
 
 `ollama-anthropic` lets Claude Code drive Ollama Cloud models over the native
-Ollama API, and forces thinking off. `ollama-mods` does the same for anything
-that already speaks the native protocol (notably `charmbracelet/mods`), adding
-the bearer token and forcing thinking off.
+Ollama API, passing thinking through as a proper Anthropic `thinking` block.
+`ollama-mods` does the same for anything that already speaks the native
+protocol (notably `charmbracelet/mods`), adding the bearer token and forcing
+thinking off.
 
 ## Requirements
 
@@ -59,9 +60,12 @@ All three OpenAI-compatible spellings are accepted without error and silently
 ignored. Because `ollama-anthropic` needs the think control, it talks to the
 native endpoint rather than the OpenAI-compatible one.
 
-Thinking is **forced off by default** in both shims. Set `PROXY_THINK=true`
-in the unit's `Environment=` (or the shell, when running in the foreground)
-to pass the model's thinking through. `PROXY_THINK` is the only knob.
+`ollama-anthropic` **passes thinking through by default**: the model's
+reasoning arrives in `message.thinking`, and the shim turns it into an Anthropic
+`thinking` block that Claude Code renders collapsed. `ollama-mods` still
+**forces thinking off by default**. `PROXY_THINK` is the only knob in either
+shim, and both read the same spellings: `false`, `0`, `off`, and `no` mean off,
+`true`, `1`, `on`, and `yes` mean on, any case. Only the default differs.
 
 ## Status
 
