@@ -72,6 +72,7 @@ and is not used in production.
 ## Endpoints
 
 - `POST /v1/messages` — Anthropic Messages (streaming + non-streaming, including tool calls)
+  - Translates native OpenAI tool calls plus complete DeepSeek DSML-in-content invocations for tools supplied by the client. Malformed or unoffered DSML remains ordinary text.
 - `GET /v1/models` — lists the configured model
 - `GET /healthz` — liveness + key-presence check
 
