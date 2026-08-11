@@ -50,7 +50,7 @@ const MODEL = process.env.PROXY_MODEL || "deepseek-v4-flash:0731";
 // block. Only the native endpoint can do this on Ollama Cloud. `false`, `0`,
 // `off`, and `no` all mean off (any case) -- an operator who writes
 // PROXY_THINK=0 means off, and silently passing thinking through would be the
-// opposite of what they configured. ollama-mods reads the same spellings.
+// opposite of what they configured.
 const THINK = !isFalsey(process.env.PROXY_THINK);
 
 function isFalsey(value) {

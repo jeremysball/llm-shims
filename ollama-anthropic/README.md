@@ -33,9 +33,7 @@ so Claude Code renders it collapsed instead of as ordinary text in the answer.
 
 Set `PROXY_THINK` in the unit's `Environment=` (or the shell, when running in
 the foreground) to override. `false`, `0`, `off`, and `no` force thinking off.
-`true`, `1`, `on`, and `yes` pass it through. Matching ignores case, and
-`ollama-mods` reads the same spellings, so one value means the same thing in
-both shims. Only the default differs.
+`true`, `1`, `on`, and `yes` pass it through. Matching ignores case.
 
 Thinking blocks round-trip. One echoed back in a later request goes upstream as
 `message.thinking` rather than getting dropped, so a multi-turn conversation
@@ -52,7 +50,7 @@ journalctl --user -u ollama-anthropic-proxy -f      # logs
 ```
 
 Unit: `~/.config/systemd/user/ollama-anthropic-proxy.service`, written by
-`mise run install` in the repo root. Bound to `127.0.0.1:3445`
+`mise run ollama-anthropic-install` in the repo root. Bound to `127.0.0.1:3445`
 (local only). The API key lives in `~/.config/ollama-anthropic-proxy/env`
 (mode 600, loaded via `EnvironmentFile=`) since a systemd --user unit doesn't
 inherit the harness-injected `OLLAMA_CLOUD_API_KEY` that's only present inside

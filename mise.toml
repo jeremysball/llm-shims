@@ -2,29 +2,22 @@
 # Pinned to the runtime the systemd unit already launches this proxy with.
 node = "26.5.1"
 
-[tasks.anthropic]
+[tasks.ollama-anthropic]
 description = "Run the Ollama->Anthropic proxy in the foreground (Anthropic Messages for Claude Code)"
 run = "node ollama-anthropic/proxy.mjs"
 
-[tasks.mods]
-description = "Run the Ollama->mods proxy in the foreground (native /api/chat, thinking forced off)"
-run = "node ollama-mods/proxy.mjs"
-
-[tasks.health]
-description = "Check both proxies' /healthz endpoints"
+[tasks.ollama-anthropic-health]
+description = "Check the proxy's /healthz endpoint"
 run = '''
 #!/usr/bin/env bash
 set -uo pipefail
 printf 'anthropic (%s): ' "${PROXY_PORT:-3445}"
 curl -fsS --max-time 3 "http://127.0.0.1:${PROXY_PORT:-3445}/healthz" || echo "not responding"
 echo
-printf 'mods (3446): '
-curl -fsS --max-time 3 "http://127.0.0.1:3446/healthz" || echo "not responding"
-echo
 '''
 
-[tasks.install]
-description = "Install both proxies as systemd --user services pointing at this checkout"
+[tasks.ollama-anthropic-install]
+description = "Install the proxy as a systemd --user service pointing at this checkout"
 run = '''
 #!/usr/bin/env bash
 set -euo pipefail
@@ -54,26 +47,6 @@ WantedBy=default.target
 UNIT
 echo "wrote $UNIT_DIR/ollama-anthropic-proxy.service"
 
-cat > "$UNIT_DIR/ollama-mods-proxy.service" <<UNIT
-[Unit]
-Description=Ollama Cloud -> mods proxy (native /api/chat, thinking forced off)
-After=network-online.target
-
-[Service]
-Type=simple
-ExecStart=$NODE $REPO/ollama-mods/proxy.mjs
-Restart=on-failure
-RestartSec=3
-EnvironmentFile=${XDG_CONFIG_HOME:-$HOME/.config}/ollama-anthropic-proxy/env
-Environment=PROXY_PORT=3446
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=default.target
-UNIT
-echo "wrote $UNIT_DIR/ollama-mods-proxy.service"
-
 systemctl --user daemon-reload
-echo "Now: systemctl --user enable --now ollama-anthropic-proxy ollama-mods-proxy"
+echo "Now: systemctl --user enable --now ollama-anthropic-proxy"
 '''
