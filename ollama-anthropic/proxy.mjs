@@ -9,7 +9,7 @@
 //     body:    {model, messages, stream, stream_options, tools} — standard
 //     OpenAI chat-completions shape
 //     streaming tool calls confirmed via curl: delta.tool_calls[].function.{name,arguments}
-//     arrive incrementally, keyed by index (not always id) — see toolBlocksByIndex below.
+//     arrive incrementally, keyed by index or id when available.
 //     token usage only arrives if stream_options.include_usage is asked for,
 //     and then only in a final chunk that carries an empty choices array.
 
@@ -139,7 +139,78 @@ function sse(obj) {
 
 const FINISH_TO_STOP_REASON = { tool_calls: "tool_use", length: "max_tokens", stop: "end_turn" };
 
-async function streamTranslated(upstreamRes, reply, clientModel, reqId) {
+function createDsmlDecoder(offeredToolNames) {
+  const open = "<｜DSML｜invoke name=\"";
+  const close = "</｜DSML｜invoke>";
+  let buffer = "";
+
+  function parseInvocation(source) {
+    const match = source.match(/^<｜DSML｜invoke name="([^"]+)">\n([\s\S]*)<\/｜DSML｜invoke>$/);
+    if (!match || !offeredToolNames.has(match[1])) return null;
+
+    const input = {};
+    const parameter = /<｜DSML｜parameter name="([^"]+)">([\s\S]*?)(?:<｜DSML｜parameter>|<\/｜DSML｜parameter>)/g;
+    let offset = 0;
+    for (let item; (item = parameter.exec(match[2])); ) {
+      if (match[2].slice(offset, item.index).trim() || Object.hasOwn(input, item[1])) return null;
+      Object.defineProperty(input, item[1], { value: item[2], enumerable: true });
+      offset = parameter.lastIndex;
+    }
+    if (match[2].slice(offset).trim() || offset === 0 && match[2].trim()) return null;
+    return { name: match[1], input };
+  }
+
+  function drain(final = false) {
+    const parts = [];
+    while (buffer) {
+      const start = buffer.indexOf(open);
+      if (start < 0) {
+        let keep = 0;
+        if (!final) {
+          const maxLength = Math.min(buffer.length, open.length - 1);
+          for (let length = maxLength; length > 0; length--) {
+            if (buffer.endsWith(open.slice(0, length))) {
+              keep = length;
+              break;
+            }
+          }
+        }
+        if (buffer.length > keep) parts.push({ type: "text", text: buffer.slice(0, buffer.length - keep) });
+        buffer = buffer.slice(buffer.length - keep);
+        break;
+      }
+      if (start > 0) {
+        parts.push({ type: "text", text: buffer.slice(0, start) });
+        buffer = buffer.slice(start);
+      }
+      const end = buffer.indexOf(close, open.length);
+      if (end < 0) {
+        if (final) {
+          parts.push({ type: "text", text: buffer });
+          buffer = "";
+        }
+        break;
+      }
+      const source = buffer.slice(0, end + close.length);
+      const invocation = parseInvocation(source);
+      parts.push(invocation ? { type: "tool", ...invocation } : { type: "text", text: source });
+      buffer = buffer.slice(source.length);
+    }
+    return parts;
+  }
+
+  return {
+    push(text) {
+      buffer += text;
+      return drain();
+    },
+    finish() {
+      return drain(true);
+    },
+  };
+}
+
+async function streamTranslated(upstreamRes, reply, clientModel, reqId, offeredToolNames) {
   reply.writeHead(200, {
     "Content-Type": "text/event-stream",
     "Cache-Control": "no-cache",
@@ -152,90 +223,196 @@ async function streamTranslated(upstreamRes, reply, clientModel, reqId) {
   reply.write(sse({ type: "message_start", message: { id: reqId, type: "message", role: "assistant", model: clientModel, content: [], stop_reason: null, usage: { input_tokens: 0, output_tokens: 0 } } }));
   reply.write(sse({ type: "ping" }));
 
-  let textBlockOpen = false;
-  const textBlockIndex = 0;
-  const toolBlocksByIndex = new Map(); // openai tool_call index -> {blockIndex, opened}
-  let nextBlockIndex = 1;
+  let textBlock = null;
+  // A native OpenAI tool-call delta may resume after any later content delta.
+  // Anthropic blocks cannot receive deltas after their stop event, so defer
+  // events only after the first native tool call; ordinary text still streams.
+  let deferContent = false;
+  const toolBlocksByKey = new Map();
+  const deferredEvents = [];
+  let emittedToolUse = false;
+  let anonymousToolCallCount = 0;
+  let nextBlockIndex = 0;
   let stopReason = "end_turn";
   let usage = { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 };
   let buffer = "";
+  const dsml = createDsmlDecoder(offeredToolNames);
+
+  const closeTextBlock = () => {
+    if (!textBlock) return;
+    reply.write(sse({ type: "content_block_stop", index: textBlock.blockIndex }));
+    textBlock = null;
+  };
+  const emitNativeToolBlock = (block) => {
+    if (block.emitted) return;
+    closeTextBlock();
+    block.blockIndex = nextBlockIndex++;
+    emitToolUse(block);
+    if (block.arguments) {
+      reply.write(sse({ type: "content_block_delta", index: block.blockIndex, delta: { type: "input_json_delta", partial_json: block.arguments } }));
+    }
+    reply.write(sse({ type: "content_block_stop", index: block.blockIndex }));
+    block.emitted = true;
+  };
+  const emitDeferredEvents = () => {
+    for (const event of deferredEvents) {
+      if (event.type === "native") emitNativeToolBlock(event.block);
+      else if (event.type === "dsml") {
+        const blockIndex = nextBlockIndex++;
+        const block = {
+          blockIndex,
+          contentBlock: { type: "tool_use", id: `toolu_dsml_${Math.random().toString(36).slice(2, 12)}`, name: event.invocation.name, input: {} },
+        };
+        emitToolUse(block);
+        reply.write(sse({ type: "content_block_delta", index: blockIndex, delta: { type: "input_json_delta", partial_json: JSON.stringify(event.invocation.input) } }));
+        reply.write(sse({ type: "content_block_stop", index: blockIndex }));
+      } else {
+        deferContent = false;
+        emitText(event.text);
+        deferContent = true;
+      }
+    }
+    deferContent = false;
+  };
+  const emitText = (text) => {
+    if (!text) return;
+    if (deferContent) {
+      deferredEvents.push({ type: "text", text });
+      return;
+    }
+    if (!textBlock) {
+      textBlock = { blockIndex: nextBlockIndex++ };
+      reply.write(sse({ type: "content_block_start", index: textBlock.blockIndex, content_block: { type: "text", text: "" } }));
+    }
+    reply.write(sse({ type: "content_block_delta", index: textBlock.blockIndex, delta: { type: "text_delta", text } }));
+  };
+  const emitToolUse = (block) => {
+    closeTextBlock();
+    reply.write(sse({ type: "content_block_start", index: block.blockIndex, content_block: block.contentBlock }));
+  };
+  const emitDsmlInvocation = (invocation) => {
+    emittedToolUse = true;
+    stopReason = "tool_use";
+    deferContent = true;
+    deferredEvents.push({ type: "dsml", invocation });
+  };
+  const emitDsmlParts = (parts) => {
+    for (const part of parts) {
+      if (part.type === "text") emitText(part.text);
+      else emitDsmlInvocation(part);
+    }
+  };
+
+  const processFrame = (frame) => {
+    let dataLine = "";
+    for (const ln of frame.split("\n")) if (ln.startsWith("data:")) dataLine += ln.slice(5).trim();
+    if (!dataLine || dataLine === "[DONE]") return;
+    let ev;
+    try { ev = JSON.parse(dataLine); } catch { return; }
+
+    if (ev.usage) {
+      usage = {
+        input_tokens: ev.usage.prompt_tokens || 0,
+        output_tokens: ev.usage.completion_tokens || 0,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+      };
+    }
+
+    const choice = ev.choices?.[0];
+    if (!choice) return;
+    const delta = choice.delta || {};
+    if (delta.content) emitDsmlParts(dsml.push(delta.content));
+    if (Array.isArray(delta.tool_calls)) {
+      for (const tc of delta.tool_calls) {
+        const indexKey = tc.index === undefined ? null : `index:${tc.index}`;
+        const idKey = tc.id ? `id:${tc.id}` : null;
+        const indexedBlock = indexKey ? toolBlocksByKey.get(indexKey) : null;
+        let block = idKey ? toolBlocksByKey.get(idKey) : null;
+        if (!block && indexedBlock && (!tc.id || indexedBlock.contentBlock.id.startsWith("toolu_native_"))) {
+          block = indexedBlock;
+        }
+        if (!block) {
+          emittedToolUse = true;
+          deferContent = true;
+          block = {
+            blockIndex: null,
+            emitted: false,
+            arguments: "",
+            contentBlock: { type: "tool_use", id: tc.id || `toolu_native_${Math.random().toString(36).slice(2, 12)}`, name: tc.function?.name || "", input: {} },
+          };
+          toolBlocksByKey.set(indexKey || `anonymous:${anonymousToolCallCount++}`, block);
+          deferredEvents.push({ type: "native", block });
+        }
+        if (indexKey && !indexedBlock) toolBlocksByKey.set(indexKey, block);
+        if (idKey) toolBlocksByKey.set(idKey, block);
+        if (tc.id && block.contentBlock.id.startsWith("toolu_native_")) block.contentBlock.id = tc.id;
+        if (tc.function?.name) block.contentBlock.name = tc.function.name;
+        if (tc.function?.arguments) block.arguments += tc.function.arguments;
+      }
+    }
+    if (choice.finish_reason) {
+      const upstreamStopReason = FINISH_TO_STOP_REASON[choice.finish_reason] || "end_turn";
+      stopReason = upstreamStopReason === "end_turn" && emittedToolUse ? "tool_use" : upstreamStopReason;
+    }
+  };
 
   const reader = upstreamRes.body.getReader();
   const dec = new TextDecoder();
+  let idx;
   for (;;) {
     const { done, value } = await reader.read();
     if (done) break;
     buffer += dec.decode(value, { stream: true });
-    let idx;
     while ((idx = buffer.indexOf("\n\n")) >= 0) {
       const frame = buffer.slice(0, idx);
       buffer = buffer.slice(idx + 2);
-      let dataLine = "";
-      for (const ln of frame.split("\n")) if (ln.startsWith("data:")) dataLine += ln.slice(5).trim();
-      if (!dataLine || dataLine === "[DONE]") continue;
-      let ev;
-      try { ev = JSON.parse(dataLine); } catch { continue; }
-
-      // The usage chunk arrives last and carries choices: [], so this has to
-      // come before the choice guard below or it gets thrown away.
-      if (ev.usage) {
-        usage = {
-          input_tokens: ev.usage.prompt_tokens || 0,
-          output_tokens: ev.usage.completion_tokens || 0,
-          cache_creation_input_tokens: 0,
-          cache_read_input_tokens: 0,
-        };
-      }
-
-      const choice = ev.choices?.[0];
-      if (!choice) continue;
-      const delta = choice.delta || {};
-
-      if (delta.content) {
-        if (!textBlockOpen) {
-          reply.write(sse({ type: "content_block_start", index: textBlockIndex, content_block: { type: "text", text: "" } }));
-          textBlockOpen = true;
-        }
-        reply.write(sse({ type: "content_block_delta", index: textBlockIndex, delta: { type: "text_delta", text: delta.content } }));
-      }
-
-      if (Array.isArray(delta.tool_calls)) {
-        for (const tc of delta.tool_calls) {
-          let block = toolBlocksByIndex.get(tc.index);
-          if (!block) {
-            block = { blockIndex: nextBlockIndex++, opened: true };
-            toolBlocksByIndex.set(tc.index, block);
-            reply.write(sse({ type: "content_block_start", index: block.blockIndex, content_block: { type: "tool_use", id: tc.id, name: tc.function?.name || "", input: {} } }));
-          }
-          if (tc.function?.arguments) {
-            reply.write(sse({ type: "content_block_delta", index: block.blockIndex, delta: { type: "input_json_delta", partial_json: tc.function.arguments } }));
-          }
-        }
-      }
-
-      if (choice.finish_reason) {
-        stopReason = FINISH_TO_STOP_REASON[choice.finish_reason] || "end_turn";
-      }
+      processFrame(frame);
     }
   }
-  if (textBlockOpen) reply.write(sse({ type: "content_block_stop", index: textBlockIndex }));
-  for (const block of toolBlocksByIndex.values()) reply.write(sse({ type: "content_block_stop", index: block.blockIndex }));
+  buffer += dec.decode();
+  while ((idx = buffer.indexOf("\n\n")) >= 0) {
+    const frame = buffer.slice(0, idx);
+    buffer = buffer.slice(idx + 2);
+    processFrame(frame);
+  }
+  emitDsmlParts(dsml.finish());
+  emitDeferredEvents();
+  closeTextBlock();
   reply.write(sse({ type: "message_delta", delta: { stop_reason: stopReason, stop_sequence: null }, usage }));
   reply.write(sse({ type: "message_stop" }));
   reply.end();
 }
 
-async function bufferTranslated(upstreamRes, reply, clientModel, reqId) {
+async function bufferTranslated(upstreamRes, reply, clientModel, reqId, offeredToolNames) {
   const json = await upstreamRes.json();
   const msg = json.choices?.[0]?.message || {};
   const content = [];
-  if (msg.content) content.push({ type: "text", text: msg.content });
+  let dsmlToolUse = false;
+  if (msg.content) {
+    const dsml = createDsmlDecoder(offeredToolNames);
+    for (const part of [...dsml.push(msg.content), ...dsml.finish()]) {
+      if (part.type === "text") content.push({ type: "text", text: part.text });
+      else {
+        dsmlToolUse = true;
+        content.push({
+          type: "tool_use",
+          id: `toolu_dsml_${Math.random().toString(36).slice(2, 12)}`,
+          name: part.name,
+          input: part.input,
+        });
+      }
+    }
+  }
   for (const tc of msg.tool_calls || []) {
     let input = {};
     try { input = JSON.parse(tc.function.arguments); } catch {}
-    content.push({ type: "tool_use", id: tc.id, name: tc.function.name, input });
+    content.push({ type: "tool_use", id: tc.id || `toolu_native_${Math.random().toString(36).slice(2, 12)}`, name: tc.function.name, input });
   }
-  const stopReason = FINISH_TO_STOP_REASON[json.choices?.[0]?.finish_reason] || "end_turn";
+  const upstreamStopReason = FINISH_TO_STOP_REASON[json.choices?.[0]?.finish_reason] || "end_turn";
+  const stopReason = upstreamStopReason === "end_turn" && (dsmlToolUse || msg.tool_calls?.length)
+    ? "tool_use"
+    : upstreamStopReason;
   const usage = {
     input_tokens: json.usage?.prompt_tokens || 0,
     output_tokens: json.usage?.completion_tokens || 0,
@@ -269,8 +446,12 @@ async function forward(anth, reply) {
     reply.end(JSON.stringify({ type: "error", error: { type: "upstream_error", message: `upstream ${upstreamRes.status}: ${errText.slice(0, 500)}` } }));
     return;
   }
-  if (wantStream) await streamTranslated(upstreamRes, reply, clientModel, reqId);
-  else await bufferTranslated(upstreamRes, reply, clientModel, reqId);
+  const offeredToolNames = new Set((anth.tools || []).map((tool) => tool.name).filter(Boolean));
+  if (wantStream) {
+    await streamTranslated(upstreamRes, reply, clientModel, reqId, offeredToolNames);
+  } else {
+    await bufferTranslated(upstreamRes, reply, clientModel, reqId, offeredToolNames);
+  }
 }
 
 const server = http.createServer(async (req, reply) => {
