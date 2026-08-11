@@ -9,9 +9,12 @@ another small proxy, not adding a branch to a growing multi-backend server.
 | Shim | Listens | Speaks to clients | Forwards to |
 |---|---|---|---|
 | [`ollama-anthropic`](ollama-anthropic/) | 127.0.0.1:3445 | Anthropic Messages | `ollama.com/api/chat` |
+| [`ollama-mods`](ollama-mods/) | 127.0.0.1:3446 | Ollama native | `ollama.com/api/chat` |
 
 `ollama-anthropic` lets Claude Code drive Ollama Cloud models over the native
-Ollama API, and forces thinking off.
+Ollama API, and forces thinking off. `ollama-mods` does the same for anything
+that already speaks the native protocol (notably `charmbracelet/mods`), adding
+the bearer token and forcing thinking off.
 
 ## Requirements
 
@@ -31,12 +34,13 @@ environment.
 git clone https://github.com/jeremysball/llm-shims.git
 cd llm-shims
 mise install                 # node, pinned
-mise run install             # write the systemd --user unit for this checkout
-systemctl --user enable --now ollama-anthropic-proxy
-mise run health              # /healthz endpoint
+mise run install             # write the systemd --user units for this checkout
+systemctl --user enable --now ollama-anthropic-proxy ollama-mods-proxy
+mise run health              # both /healthz endpoints
 ```
 
-To run the proxy in the foreground instead: `mise run anthropic`.
+To run a proxy in the foreground instead: `mise run anthropic` or
+`mise run mods`.
 
 ## Why native, and where the think control went
 
@@ -55,10 +59,9 @@ All three OpenAI-compatible spellings are accepted without error and silently
 ignored. Because `ollama-anthropic` needs the think control, it talks to the
 native endpoint rather than the OpenAI-compatible one.
 
-Thinking is **forced off by default**. Set `PROXY_THINK=true` in the unit's
-`Environment=` (or the shell, when running in the foreground) to pass the
-model's thinking through. `PROXY_THINK` is the only knob; there is no
-separate think shim.
+Thinking is **forced off by default** in both shims. Set `PROXY_THINK=true`
+in the unit's `Environment=` (or the shell, when running in the foreground)
+to pass the model's thinking through. `PROXY_THINK` is the only knob.
 
 ## Status
 
@@ -66,3 +69,7 @@ separate think shim.
 Code. It now reports real token counts (input/output) on every turn, so the
 Claude Code statusline context gauge reads correctly on Ollama Cloud
 sessions.
+
+`ollama-mods` is a new shim built from the same native-endpoint findings; it
+strips thinking and adds auth for native-protocol clients. See its own README
+for the `mods` integration and its known caveats.
