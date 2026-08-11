@@ -163,16 +163,16 @@ function sse(obj) {
 const FINISH_TO_STOP_REASON = { tool_calls: "tool_use", length: "max_tokens", stop: "end_turn" };
 
 function createDsmlDecoder(offeredToolNames) {
-  const open = "<invoke name=\"";
-  const close = "</invoke>";
+  const open = "<｜DSML｜invoke name=\"";
+  const close = "</｜DSML｜invoke>";
   let buffer = "";
 
   function parseInvocation(source) {
-    const match = source.match(/^<invoke name="([^"]+)">\n([\s\S]*)<\/invoke>$/);
+    const match = source.match(/^<｜DSML｜invoke name="([^"]+)">\n([\s\S]*)<\/｜DSML｜invoke>$/);
     if (!match || !offeredToolNames.has(match[1])) return null;
 
     const input = {};
-    const parameter = /<parameter name="([^"]+)">([\s\S]*?)(?:<parameter>|<\/parameter>)/g;
+    const parameter = /<｜DSML｜parameter name="([^"]+)">([\s\S]*?)(?:<｜DSML｜parameter>|<\/｜DSML｜parameter>)/g;
     let offset = 0;
     for (let item; (item = parameter.exec(match[2])); ) {
       if (match[2].slice(offset, item.index).trim() || Object.hasOwn(input, item[1])) return null;

@@ -234,7 +234,7 @@ test("generates a tool-use id for non-streaming native tool calls without one", 
 
 test("translates DSML with a slashed parameter terminator", async () => {
   upstreamChunks = [
-    { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "<invoke name=\"Bash\">\n<parameter name=\"command\">pwd</parameter>\n</invoke>" }, done: false },
+    { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "<｜DSML｜invoke name=\"Bash\">\n<｜DSML｜parameter name=\"command\">pwd</｜DSML｜parameter>\n</｜DSML｜invoke>" }, done: false },
     { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "" }, done: true, done_reason: "tool_calls", prompt_eval_count: 3, eval_count: 2 },
   ];
 
@@ -254,8 +254,8 @@ test("translates DSML with a slashed parameter terminator", async () => {
 
 test("translates a fragmented DSML invocation into a tool-use block", async () => {
   upstreamChunks = [
-    { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "<invoke name=\"Bash\">\n<parameter name=\"description\">Find the ferry project" }, done: false },
-    { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: " location<parameter>\n<parameter name=\"command\">pwd<parameter>\n</invoke>" }, done: false },
+    { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "<｜DSML｜invoke name=\"Bash\">\n<｜DSML｜parameter name=\"description\">Find the ferry project" }, done: false },
+    { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: " location<｜DSML｜parameter>\n<｜DSML｜parameter name=\"command\">pwd<｜DSML｜parameter>\n</｜DSML｜invoke>" }, done: false },
     { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "" }, done: true, done_reason: "tool_calls", prompt_eval_count: 3, eval_count: 2 },
   ];
 
@@ -270,7 +270,7 @@ test("translates a fragmented DSML invocation into a tool-use block", async () =
     .filter((line) => line.startsWith("data:"))
     .map((line) => JSON.parse(line.slice(5)));
 
-  assert.ok(!events.some((event) => event.delta?.text?.includes("<invoke>")), "DSML must not leak into a text delta");
+  assert.ok(!events.some((event) => event.delta?.text?.includes("<｜DSML｜invoke>")), "DSML must not leak into a text delta");
   const start = events.find((event) => event.type === "content_block_start" && event.content_block.type === "tool_use");
   assert.equal(start?.content_block.name, "Bash");
   const input = events.find((event) => event.type === "content_block_delta" && event.delta.type === "input_json_delta");
@@ -305,7 +305,7 @@ test("keeps a native tool call intact when its id arrives after its index", asyn
 test("does not truncate native tool arguments around a DSML invocation", async () => {
   upstreamChunks = [
     { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "", tool_calls: [{ id: "call_read", function: { index: 0, name: "Read", arguments: { file_path: "/etc/passwd" } } }] }, done: false },
-    { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "<invoke name=\"Bash\">\n<parameter name=\"command\">pwd<parameter>\n</invoke>" }, done: false },
+    { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "<｜DSML｜invoke name=\"Bash\">\n<｜DSML｜parameter name=\"command\">pwd<｜DSML｜parameter>\n</｜DSML｜invoke>" }, done: false },
     { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "" }, done: true, done_reason: "tool_calls", prompt_eval_count: 3, eval_count: 2 },
   ];
 
@@ -335,7 +335,7 @@ test("preserves native, text, and DSML event order while native arguments stream
   upstreamChunks = [
     { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "", tool_calls: [{ id: "call_read", function: { index: 0, name: "Read", arguments: { file_path: "/etc/passwd" } } }] }, done: false },
     { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "Checking it first. " }, done: false },
-    { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "<invoke name=\"Bash\">\n<parameter name=\"command\">pwd<parameter>\n</invoke>Then run it." }, done: true, done_reason: "tool_calls", prompt_eval_count: 3, eval_count: 2 },
+    { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "<｜DSML｜invoke name=\"Bash\">\n<｜DSML｜parameter name=\"command\">pwd<｜DSML｜parameter>\n</｜DSML｜invoke>Then run it." }, done: true, done_reason: "tool_calls", prompt_eval_count: 3, eval_count: 2 },
   ];
 
   const res = await messages({
@@ -371,7 +371,7 @@ test("preserves native, text, and DSML event order while native arguments stream
 
 test("reports tool_use when DSML text ends with an ordinary stop", async () => {
   upstreamChunks = [
-    { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "<invoke name=\"Bash\">\n<parameter name=\"command\">pwd<parameter>\n</invoke>" }, done: true, done_reason: "stop", prompt_eval_count: 3, eval_count: 2 },
+    { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "<｜DSML｜invoke name=\"Bash\">\n<｜DSML｜parameter name=\"command\">pwd<｜DSML｜parameter>\n</｜DSML｜invoke>" }, done: true, done_reason: "stop", prompt_eval_count: 3, eval_count: 2 },
   ];
 
   const res = await messages({
@@ -390,7 +390,7 @@ test("reports tool_use when DSML text ends with an ordinary stop", async () => {
 
 test("preserves max_tokens when a DSML invocation ends at the output limit", async () => {
   upstreamChunks = [
-    { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "<invoke name=\"Bash\">\n<parameter name=\"command\">pwd<parameter>\n</invoke>" }, done: true, done_reason: "length", prompt_eval_count: 3, eval_count: 2 },
+    { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "<｜DSML｜invoke name=\"Bash\">\n<｜DSML｜parameter name=\"command\">pwd<｜DSML｜parameter>\n</｜DSML｜invoke>" }, done: true, done_reason: "length", prompt_eval_count: 3, eval_count: 2 },
   ];
 
   const res = await messages({
@@ -409,7 +409,7 @@ test("preserves max_tokens when a DSML invocation ends at the output limit", asy
 
 test("preserves DSML and native tool-call order", async () => {
   upstreamChunks = [
-    { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "<invoke name=\"Bash\">\n<parameter name=\"command\">pwd<parameter>\n</invoke>" }, done: false },
+    { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "<｜DSML｜invoke name=\"Bash\">\n<｜DSML｜parameter name=\"command\">pwd<｜DSML｜parameter>\n</｜DSML｜invoke>" }, done: false },
     { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "", tool_calls: [{ id: "call_read", function: { index: 0, name: "Read", arguments: { file_path: "a.txt" } } }] }, done: true, done_reason: "tool_calls", prompt_eval_count: 3, eval_count: 2 },
   ];
 
@@ -433,7 +433,7 @@ test("preserves DSML and native tool-call order", async () => {
 
 test("keeps content block indices monotonic when a DSML tool call precedes text", async () => {
   upstreamChunks = [
-    { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "<invoke name=\"Bash\">\n<parameter name=\"command\">pwd<parameter>\n</invoke>" }, done: false },
+    { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "<｜DSML｜invoke name=\"Bash\">\n<｜DSML｜parameter name=\"command\">pwd<｜DSML｜parameter>\n</｜DSML｜invoke>" }, done: false },
     { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "\nI found it." }, done: true, done_reason: "tool_calls", prompt_eval_count: 3, eval_count: 2 },
   ];
 
@@ -620,7 +620,7 @@ test("generates a tool-use id when native tool deltas omit it", async () => {
 
 test("preserves malformed DSML-looking text", async () => {
   upstreamChunks = [
-    { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "<invoke name=\"Bash\">unfinished" }, done: true, done_reason: "stop", prompt_eval_count: 3, eval_count: 2 },
+    { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "<｜DSML｜invoke name=\"Bash\">unfinished" }, done: true, done_reason: "stop", prompt_eval_count: 3, eval_count: 2 },
   ];
 
   const res = await messages({
@@ -635,12 +635,12 @@ test("preserves malformed DSML-looking text", async () => {
     .map((line) => JSON.parse(line.slice(5)));
 
   assert.equal(events.filter((event) => event.type === "content_block_start" && event.content_block.type === "tool_use").length, 0);
-  assert.equal(events.find((event) => event.delta?.type === "text_delta")?.delta.text, "<invoke name=\"Bash\">unfinished");
+  assert.equal(events.find((event) => event.delta?.type === "text_delta")?.delta.text, "<｜DSML｜invoke name=\"Bash\">unfinished");
 });
 
 test("preserves DSML with duplicate parameter names", async () => {
   upstreamChunks = [
-    { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "<invoke name=\"Bash\">\n<parameter name=\"command\">pwd<parameter>\n<parameter name=\"command\">whoami<parameter>\n</invoke>" }, done: true, done_reason: "stop", prompt_eval_count: 3, eval_count: 2 },
+    { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "<｜DSML｜invoke name=\"Bash\">\n<｜DSML｜parameter name=\"command\">pwd<｜DSML｜parameter>\n<｜DSML｜parameter name=\"command\">whoami<｜DSML｜parameter>\n</｜DSML｜invoke>" }, done: true, done_reason: "stop", prompt_eval_count: 3, eval_count: 2 },
   ];
 
   const res = await messages({
@@ -655,13 +655,13 @@ test("preserves DSML with duplicate parameter names", async () => {
     .map((line) => JSON.parse(line.slice(5)));
 
   assert.equal(events.filter((event) => event.type === "content_block_start" && event.content_block.type === "tool_use").length, 0);
-  assert.match(events.find((event) => event.delta?.type === "text_delta")?.delta.text, /<parameter name="command">whoami/);
+  assert.match(events.find((event) => event.delta?.type === "text_delta")?.delta.text, /<｜DSML｜parameter name="command">whoami/);
 });
 
 test("translates DSML in non-streaming responses", async () => {
   upstreamMessage = {
     model: "deepseek-v4-flash:0731",
-    message: { role: "assistant", content: "<invoke name=\"Bash\">\n<parameter name=\"command\">pwd<parameter>\n</invoke>" },
+    message: { role: "assistant", content: "<｜DSML｜invoke name=\"Bash\">\n<｜DSML｜parameter name=\"command\">pwd<｜DSML｜parameter>\n</｜DSML｜invoke>" },
     done: true,
     done_reason: "tool_calls",
     prompt_eval_count: 4242,
@@ -682,7 +682,7 @@ test("translates DSML in non-streaming responses", async () => {
 
 test("does not translate a DSML invocation for an unoffered tool", async () => {
   upstreamChunks = [
-    { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "<invoke name=\"Bash\">\n<parameter name=\"command\">pwd<parameter>\n</invoke>" }, done: true, done_reason: "stop", prompt_eval_count: 3, eval_count: 2 },
+    { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "<｜DSML｜invoke name=\"Bash\">\n<｜DSML｜parameter name=\"command\">pwd<｜DSML｜parameter>\n</｜DSML｜invoke>" }, done: true, done_reason: "stop", prompt_eval_count: 3, eval_count: 2 },
   ];
 
   const res = await messages({ model: "m", stream: true, tools: [{ name: "Read", description: "Read a file", input_schema: { type: "object", properties: {} } }], messages: [{ role: "user", content: "find it" }] });
@@ -692,7 +692,7 @@ test("does not translate a DSML invocation for an unoffered tool", async () => {
     .map((line) => JSON.parse(line.slice(5)));
 
   assert.equal(events.filter((event) => event.type === "content_block_start" && event.content_block.type === "tool_use").length, 0);
-  assert.equal(events.find((event) => event.delta?.type === "text_delta")?.delta.text, "<invoke name=\"Bash\">\n<parameter name=\"command\">pwd<parameter>\n</invoke>");
+  assert.equal(events.find((event) => event.delta?.type === "text_delta")?.delta.text, "<｜DSML｜invoke name=\"Bash\">\n<｜DSML｜parameter name=\"command\">pwd<｜DSML｜parameter>\n</｜DSML｜invoke>");
 });
 
 test("accepts an IPv6 loopback PROXY_UPSTREAM", async () => {
