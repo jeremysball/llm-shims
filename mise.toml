@@ -22,7 +22,7 @@ run = '''
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO="$(cd "$(dirname "${BASH_SOURCE[0]:-$PWD}")" && pwd)"
+REPO="$(pwd -P)"
 UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 NODE="$(command -v node)"
 mkdir -p "$UNIT_DIR"
