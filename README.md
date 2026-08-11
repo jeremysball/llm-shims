@@ -9,13 +9,9 @@ another small proxy, not adding a branch to a growing multi-backend server.
 | Shim | Listens | Speaks to clients | Forwards to |
 |---|---|---|---|
 | [`ollama-anthropic`](ollama-anthropic/) | 127.0.0.1:3445 | Anthropic Messages | `ollama.com/api/chat` |
-| [`ollama-mods`](ollama-mods/) | 127.0.0.1:3446 | Ollama native | `ollama.com/api/chat` |
 
 `ollama-anthropic` lets Claude Code drive Ollama Cloud models over the native
 Ollama API, passing thinking through as a proper Anthropic `thinking` block.
-`ollama-mods` does the same for anything that already speaks the native
-protocol (notably `charmbracelet/mods`), adding the bearer token and forcing
-thinking off.
 
 ## Requirements
 
@@ -34,14 +30,13 @@ environment.
 ```bash
 git clone https://github.com/jeremysball/llm-shims.git
 cd llm-shims
-mise install                 # node, pinned
-mise run install             # write the systemd --user units for this checkout
-systemctl --user enable --now ollama-anthropic-proxy ollama-mods-proxy
-mise run health              # both /healthz endpoints
+mise install                          # node, pinned
+mise run ollama-anthropic-install     # write the systemd --user unit for this checkout
+systemctl --user enable --now ollama-anthropic-proxy
+mise run ollama-anthropic-health      # /healthz
 ```
 
-To run a proxy in the foreground instead: `mise run anthropic` or
-`mise run mods`.
+To run the proxy in the foreground instead: `mise run ollama-anthropic`.
 
 ## Why native, and where the think control went
 
@@ -62,10 +57,9 @@ native endpoint rather than the OpenAI-compatible one.
 
 `ollama-anthropic` **passes thinking through by default**: the model's
 reasoning arrives in `message.thinking`, and the shim turns it into an Anthropic
-`thinking` block that Claude Code renders collapsed. `ollama-mods` still
-**forces thinking off by default**. `PROXY_THINK` is the only knob in either
-shim, and both read the same spellings: `false`, `0`, `off`, and `no` mean off,
-`true`, `1`, `on`, and `yes` mean on, any case. Only the default differs.
+`thinking` block that Claude Code renders collapsed. `PROXY_THINK` is the only
+knob, and it reads `false`, `0`, `off`, and `no` to mean off, `true`, `1`,
+`on`, and `yes` to mean on, any case.
 
 ## Status
 
@@ -74,6 +68,7 @@ Code. It now reports real token counts (input/output) on every turn, so the
 Claude Code statusline context gauge reads correctly on Ollama Cloud
 sessions.
 
-`ollama-mods` is a new shim built from the same native-endpoint findings; it
-strips thinking and adds auth for native-protocol clients. See its own README
-for the `mods` integration and its known caveats.
+A second shim, `ollama-mods`, briefly existed to do the same for
+`charmbracelet/mods`. It was removed once the native path turned out to be
+unusable from the client side: mods v1.8.1 never terminates an Ollama stream,
+so no proxy can make that integration work. `git log` has the details.
