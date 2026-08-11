@@ -28,11 +28,18 @@ control thinking at all. Because this proxy needs that control, it talks to the
 native endpoint.
 
 Thinking is **passed through by default**: the model's reasoning arrives in
-`message.thinking` and is translated into a proper Anthropic `thinking` block,
-so it renders as a collapsed thinking block in Claude Code rather than inline
-text. Set `PROXY_THINK=false` in the unit's `Environment=` (or the shell, when
-running in the foreground) to force thinking off — with it off, the model
-writes its reasoning inline into the answer, which is why the default is on.
+`message.thinking`, and the proxy turns it into an Anthropic `thinking` block,
+so Claude Code renders it collapsed instead of as ordinary text in the answer.
+
+Set `PROXY_THINK` in the unit's `Environment=` (or the shell, when running in
+the foreground) to override. `false`, `0`, `off`, and `no` force thinking off.
+`true`, `1`, `on`, and `yes` pass it through. Matching ignores case, and
+`ollama-mods` reads the same spellings, so one value means the same thing in
+both shims. Only the default differs.
+
+Thinking blocks round-trip. One echoed back in a later request goes upstream as
+`message.thinking` rather than getting dropped, so a multi-turn conversation
+keeps the model's own prior reasoning.
 
 ## Running
 

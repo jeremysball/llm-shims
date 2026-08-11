@@ -61,12 +61,11 @@ ignored. Because `ollama-anthropic` needs the think control, it talks to the
 native endpoint rather than the OpenAI-compatible one.
 
 `ollama-anthropic` **passes thinking through by default**: the model's
-reasoning arrives in `message.thinking` and is translated into a proper
-Anthropic `thinking` block, rendering collapsed in Claude Code. Set
-`PROXY_THINK=false` there to force thinking off (with it off the model writes
-its reasoning inline, which is why the default is on). `ollama-mods` instead
-**forces thinking off by default** — set `PROXY_THINK=true` there to pass it
-through. `PROXY_THINK` is the only knob in either shim.
+reasoning arrives in `message.thinking`, and the shim turns it into an Anthropic
+`thinking` block that Claude Code renders collapsed. `ollama-mods` still
+**forces thinking off by default**. `PROXY_THINK` is the only knob in either
+shim, and both read the same spellings: `false`, `0`, `off`, and `no` mean off,
+`true`, `1`, `on`, and `yes` mean on, any case. Only the default differs.
 
 ## Status
 

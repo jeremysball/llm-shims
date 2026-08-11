@@ -31,8 +31,11 @@ field, so it cannot talk to Ollama Cloud on its own. This proxy supplies both.
 1. **Adds auth** — injects `Authorization: Bearer $OLLAMA_CLOUD_API_KEY` on
    every forwarded request.
 2. **Forces thinking off** — rewrites `think` to `false` in the JSON body of
-   `POST /api/chat` and `POST /api/generate`. Set `PROXY_THINK=true` to pass
-   thinking through unchanged.
+   `POST /api/chat` and `POST /api/generate`. Set `PROXY_THINK` to `true`, `1`,
+   `on`, or `yes` to pass thinking through unchanged. `false`, `0`, `off`, and
+   `no` force it off. Matching ignores case, and `ollama-anthropic` reads the
+   same spellings, so one value means the same thing in both shims. Only the
+   default differs: off here, on there.
 3. **Relabels streaming responses** — Ollama Cloud returns newline-delimited
    JSON under `Content-Type: application/json`; the local daemon uses
    `application/x-ndjson`, which is what native clients (like `mods`) actually

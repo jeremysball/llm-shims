@@ -45,12 +45,17 @@ function resolveUpstream(override) {
 const PORT = Number(process.env.PROXY_PORT || 3445);
 const API_KEY = process.env.OLLAMA_CLOUD_API_KEY;
 const MODEL = process.env.PROXY_MODEL || "deepseek-v4-flash:0731";
-// PROXY_THINK=false forces thinking off. Off, the model writes its reasoning
-// inline into message.content, which then renders as plain text -- so the
-// default passes thinking through, where it arrives in message.thinking and is
-// translated into a proper Anthropic thinking block. Only the native endpoint
-// can do this on Ollama Cloud.
-const THINK = process.env.PROXY_THINK !== "false";
+// PROXY_THINK forces thinking off; the default passes it through, where it
+// arrives in message.thinking and is translated into an Anthropic thinking
+// block. Only the native endpoint can do this on Ollama Cloud. `false`, `0`,
+// `off`, and `no` all mean off (any case) -- an operator who writes
+// PROXY_THINK=0 means off, and silently passing thinking through would be the
+// opposite of what they configured. ollama-mods reads the same spellings.
+const THINK = !isFalsey(process.env.PROXY_THINK);
+
+function isFalsey(value) {
+  return /^(false|0|off|no)$/i.test((value ?? "").trim());
+}
 
 if (!API_KEY) {
   console.error("OLLAMA_CLOUD_API_KEY is not set in the environment");
@@ -105,9 +110,12 @@ function translateMessages(anth) {
 
     let last = out[out.length - 1];
     const textParts = [];
+    const thinkingParts = [];
     for (const block of content) {
       if (block.type === "text") {
         textParts.push(block.text);
+      } else if (block.type === "thinking") {
+        if (typeof block.thinking === "string") thinkingParts.push(block.thinking);
       } else if (block.type === "tool_use") {
         // Fold onto the previous assistant message if present; native requires
         // tool_calls on an assistant message. Otherwise synthesize one.
@@ -137,14 +145,20 @@ function translateMessages(anth) {
             : JSON.stringify(block.content ?? "");
         out.push({ role: "tool", content: out2 });
       }
-      // "thinking" blocks: with think=false none arrive; on passthrough they
-      // would ride in message.thinking on the native side, not as content.
     }
-    if (textParts.length) {
-      if (last && last.role === "assistant" && Array.isArray(last.tool_calls) && !last.content) {
-        last.content = textParts.join("");
+    // Claude Code echoes prior-turn thinking back as content blocks. Native puts
+    // it in message.thinking, not in content, so it is moved rather than dropped
+    // — otherwise the model loses its own reasoning on every follow-up turn.
+    const thinking = role === "assistant" && thinkingParts.length ? thinkingParts.join("") : "";
+    if (textParts.length || thinking) {
+      const foldTarget = last && last.role === "assistant" && Array.isArray(last.tool_calls) && !last.content ? last : null;
+      if (foldTarget) {
+        if (textParts.length) foldTarget.content = textParts.join("");
+        if (thinking) foldTarget.thinking = thinking;
       } else {
-        out.push({ role, content: textParts.join("") });
+        const entry = { role, content: textParts.join("") };
+        if (thinking) entry.thinking = thinking;
+        out.push(entry);
       }
     }
   }
@@ -270,8 +284,8 @@ async function streamTranslated(upstreamRes, reply, clientModel, reqId, offeredT
   // Native streams message.thinking as incremental string fragments (each frame
   // carries the next chunk, not a cumulative prefix), so coalesce them into a
   // single Anthropic thinking block: start on the first fragment, one
-  // thinking_delta per subsequent chunk, stop when the stream ends. One block,
-  // not one per frame.
+  // thinking_delta per subsequent chunk. Same { blockIndex } shape as textBlock
+  // so both share one close helper and neither guard trips on index 0.
   let thinkingBlock = null;
   // A native tool call may be interleaved with later content deltas. Anthropic
   // blocks cannot receive deltas after their stop event, so defer events after
@@ -286,14 +300,16 @@ async function streamTranslated(upstreamRes, reply, clientModel, reqId, offeredT
   let usage = { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 };
   const dsml = createDsmlDecoder(offeredToolNames);
 
+  const closeBlock = (block) => {
+    if (!block) return;
+    reply.write(sse({ type: "content_block_stop", index: block.blockIndex }));
+  };
   const closeTextBlock = () => {
-    if (!textBlock) return;
-    reply.write(sse({ type: "content_block_stop", index: textBlock.blockIndex }));
+    closeBlock(textBlock);
     textBlock = null;
   };
   const closeThinkingBlock = () => {
-    if (thinkingBlock === null) return;
-    reply.write(sse({ type: "content_block_stop", index: thinkingBlock }));
+    closeBlock(thinkingBlock);
     thinkingBlock = null;
   };
   const emitNativeToolBlock = (block) => {
@@ -319,6 +335,10 @@ async function streamTranslated(upstreamRes, reply, clientModel, reqId, offeredT
         emitToolUse(block);
         reply.write(sse({ type: "content_block_delta", index: blockIndex, delta: { type: "input_json_delta", partial_json: JSON.stringify(event.invocation.input) } }));
         reply.write(sse({ type: "content_block_stop", index: blockIndex }));
+      } else if (event.type === "thinking") {
+        deferContent = false;
+        emitThinking(event.text);
+        deferContent = true;
       } else {
         deferContent = false;
         emitText(event.text);
@@ -334,12 +354,34 @@ async function streamTranslated(upstreamRes, reply, clientModel, reqId, offeredT
       return;
     }
     if (!textBlock) {
+      // Anthropic blocks do not overlap: whatever is open ends before this one
+      // starts, so stops stay in the order the blocks were opened.
+      closeThinkingBlock();
       textBlock = { blockIndex: nextBlockIndex++ };
       reply.write(sse({ type: "content_block_start", index: textBlock.blockIndex, content_block: { type: "text", text: "" } }));
     }
     reply.write(sse({ type: "content_block_delta", index: textBlock.blockIndex, delta: { type: "text_delta", text } }));
   };
+  // Thinking rides the same defer queue as text so that a fragment arriving
+  // after a native tool call is replayed in order rather than racing ahead of
+  // the deferred tool block.
+  const emitThinking = (text) => {
+    if (!text) return;
+    if (deferContent) {
+      deferredEvents.push({ type: "thinking", text });
+      return;
+    }
+    if (!thinkingBlock) {
+      closeTextBlock();
+      thinkingBlock = { blockIndex: nextBlockIndex++ };
+      // Flat string fields, matching the Anthropic thinking block. The empty
+      // signature is what Claude Code accepts for a non-verifiable block.
+      reply.write(sse({ type: "content_block_start", index: thinkingBlock.blockIndex, content_block: { type: "thinking", thinking: "", signature: "" } }));
+    }
+    reply.write(sse({ type: "content_block_delta", index: thinkingBlock.blockIndex, delta: { type: "thinking_delta", thinking: text } }));
+  };
   const emitToolUse = (block) => {
+    closeThinkingBlock();
     closeTextBlock();
     reply.write(sse({ type: "content_block_start", index: block.blockIndex, content_block: block.contentBlock }));
   };
@@ -374,20 +416,10 @@ async function streamTranslated(upstreamRes, reply, clientModel, reqId, offeredT
     }
 
     const msg = ev.message || {};
+    // Thinking is handled before content so that a frame carrying both opens the
+    // thinking block first: Anthropic puts thinking ahead of text.
+    if (typeof msg.thinking === "string") emitThinking(msg.thinking);
     if (msg.content) emitDsmlParts(dsml.push(msg.content));
-
-    // Native streams message.thinking as incremental string fragments across
-    // frames, so coalesce them into one thinking block: start on the first, a
-    // thinking_delta per subsequent chunk, stop at end of stream. The empty
-    // signature form is what Claude Code accepts for a non-verifiable block.
-    if (typeof msg.thinking === "string" && msg.thinking) {
-      // Compare against null, not truthiness: a block index of 0 is falsy.
-      if (thinkingBlock === null) {
-        thinkingBlock = nextBlockIndex++;
-        reply.write(sse({ type: "content_block_start", index: thinkingBlock, content_block: { type: "thinking", thinking: { type: "signature", signature: "" } } }));
-      }
-      reply.write(sse({ type: "content_block_delta", index: thinkingBlock, delta: { type: "thinking_delta", thinking: { type: "text_delta", thinking: msg.thinking } } }));
-    }
 
     if (Array.isArray(msg.tool_calls)) {
       for (const tc of msg.tool_calls) {
@@ -469,6 +501,11 @@ async function bufferTranslated(upstreamRes, reply, clientModel, reqId, offeredT
   const msg = json.message || {};
   const content = [];
   let dsmlToolUse = false;
+  // Thinking goes first, and carries the same flat { thinking, signature } shape
+  // the streaming path emits — one block schema, whatever `stream` was set to.
+  if (typeof msg.thinking === "string" && msg.thinking) {
+    content.push({ type: "thinking", thinking: msg.thinking, signature: "" });
+  }
   if (msg.content) {
     const dsml = createDsmlDecoder(offeredToolNames);
     for (const part of [...dsml.push(msg.content), ...dsml.finish()]) {
@@ -483,9 +520,6 @@ async function bufferTranslated(upstreamRes, reply, clientModel, reqId, offeredT
         });
       }
     }
-  }
-  if (typeof msg.thinking === "string" && msg.thinking) {
-    content.push({ type: "thinking", thinking: msg.thinking });
   }
   for (const tc of msg.tool_calls || []) {
     let input = {};
