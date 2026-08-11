@@ -24,12 +24,22 @@ Ollama Cloud serves the same models on two endpoints, and only the native
 `/api/chat` honours the `think` switch. The OpenAI-compatible
 `/v1/chat/completions` endpoint silently ignores `think`, `reasoning`, and
 `chat_template_kwargs` spellings alike (verified 2026-08-08), so it cannot
-force thinking off. Because this proxy needs that control, it talks to the
+control thinking at all. Because this proxy needs that control, it talks to the
 native endpoint.
 
-Thinking is **forced off by default**. Set `PROXY_THINK=true` in the unit's
-`Environment=` (or the shell, when running in the foreground) to pass the
-model's thinking through.
+Thinking is **passed through by default**: the model's reasoning arrives in
+`message.thinking`, and the proxy turns it into an Anthropic `thinking` block,
+so Claude Code renders it collapsed instead of as ordinary text in the answer.
+
+Set `PROXY_THINK` in the unit's `Environment=` (or the shell, when running in
+the foreground) to override. `false`, `0`, `off`, and `no` force thinking off.
+`true`, `1`, `on`, and `yes` pass it through. Matching ignores case, and
+`ollama-mods` reads the same spellings, so one value means the same thing in
+both shims. Only the default differs.
+
+Thinking blocks round-trip. One echoed back in a later request goes upstream as
+`message.thinking` rather than getting dropped, so a multi-turn conversation
+keeps the model's own prior reasoning.
 
 ## Running
 

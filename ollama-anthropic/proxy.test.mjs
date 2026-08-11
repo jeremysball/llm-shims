@@ -122,9 +122,9 @@ async function messages(body) {
   });
 }
 
-test("forces thinking off by default", async () => {
+test("passes thinking through by default so the model emits message.thinking", async () => {
   await (await messages({ model: "m", stream: true, messages: [{ role: "user", content: "hi" }] })).text();
-  assert.equal(upstreamRequests.at(-1).think, false);
+  assert.equal(upstreamRequests.at(-1).think, true);
 });
 
 test("streams and forwards usage from the done frame on message_delta", async () => {
@@ -708,6 +708,135 @@ test("translates DSML in non-streaming responses", async () => {
   assert.equal(body.stop_reason, "tool_use");
 });
 
+// Reads a streamed response into the parsed SSE payloads, in wire order.
+async function streamEvents(body) {
+  const res = await messages(body);
+  return (await res.text())
+    .split("\n")
+    .filter((line) => line.startsWith("data:"))
+    .map((line) => JSON.parse(line.slice(5)));
+}
+
+// Block lifecycle on the wire: every start is matched by a stop, and no block
+// stays open while another one starts. This is the invariant that makes the
+// stream reconstructible by index or by stop order — they must agree.
+function assertBlocksAreSequential(events) {
+  let open = null;
+  const closed = [];
+  for (const event of events) {
+    if (event.type === "content_block_start") {
+      assert.equal(open, null, `block ${event.index} started while block ${open} was still open`);
+      open = event.index;
+    } else if (event.type === "content_block_delta") {
+      assert.equal(event.index, open, `delta for block ${event.index} outside its start/stop`);
+    } else if (event.type === "content_block_stop") {
+      assert.equal(event.index, open, `stop for block ${event.index} but block ${open} was open`);
+      closed.push(event.index);
+      open = null;
+    }
+  }
+  assert.equal(open, null, `block ${open} was never closed`);
+  assert.deepEqual(closed, [...closed].sort((a, b) => a - b), "blocks closed out of index order");
+  return closed;
+}
+
+test("coalesces fragmented streaming message.thinking into one Anthropic thinking block", async () => {
+  // Native streams thinking as incremental chunks across frames; all of them
+  // must fold into a single block with one start/stop and one delta per chunk.
+  upstreamChunks = [
+    { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "", thinking: "Let" }, done: false },
+    { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "", thinking: " me reason" }, done: false },
+    { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "Result", thinking: " about this." }, done: true, done_reason: "stop", prompt_eval_count: 3, eval_count: 2 },
+  ];
+
+  const events = await streamEvents({ model: "m", stream: true, messages: [{ role: "user", content: "hi" }] });
+
+  const thinkingStarts = events.filter((event) => event.type === "content_block_start" && event.content_block.type === "thinking");
+  assert.equal(thinkingStarts.length, 1, "fragments must coalesce into a single thinking block");
+  // Flat string fields, per the Anthropic thinking block — not a nested object.
+  assert.deepEqual(thinkingStarts[0].content_block, { type: "thinking", thinking: "", signature: "" });
+  const thinkingDeltas = events.filter((event) => event.delta?.type === "thinking_delta").map((event) => event.delta.thinking);
+  assert.deepEqual(thinkingDeltas, ["Let", " me reason", " about this."]);
+  assert.ok(!events.some((event) => event.delta?.text?.includes("Let")), "thinking must not leak into a text delta");
+  assertBlocksAreSequential(events);
+});
+
+test("opens the streaming thinking block before the text block", async () => {
+  // Anthropic puts thinking ahead of text, so a frame carrying both must not
+  // let the text block claim the lower index.
+  upstreamChunks = [
+    { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "Result", thinking: "Let me reason." }, done: true, done_reason: "stop", prompt_eval_count: 3, eval_count: 2 },
+  ];
+
+  const events = await streamEvents({ model: "m", stream: true, messages: [{ role: "user", content: "hi" }] });
+
+  const starts = events.filter((event) => event.type === "content_block_start");
+  assert.deepEqual(starts.map((event) => event.content_block.type), ["thinking", "text"]);
+  assert.ok(starts[0].index < starts[1].index, "thinking must take the lower block index");
+  assertBlocksAreSequential(events);
+});
+
+test("closes the streaming thinking block before a native tool_use block opens", async () => {
+  // Thinking rides the same defer queue as text, so a fragment arriving after a
+  // tool call cannot leave its block open across the deferred tool_use block.
+  upstreamChunks = [
+    { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "", thinking: "Need the time." }, done: false },
+    { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "Checking", tool_calls: [{ id: "call_1", function: { name: "Bash", index: 0, arguments: '{"command":"date"}' } }] }, done: false },
+    { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "", thinking: " Still thinking." }, done: true, done_reason: "stop", prompt_eval_count: 3, eval_count: 2 },
+  ];
+
+  const events = await streamEvents({
+    model: "m",
+    stream: true,
+    tools: [{ name: "Bash", input_schema: { type: "object" } }],
+    messages: [{ role: "user", content: "hi" }],
+  });
+
+  const closed = assertBlocksAreSequential(events);
+  assert.ok(closed.length >= 3, `expected thinking, text and tool_use blocks, got ${closed.length}`);
+  assert.ok(
+    events.some((event) => event.type === "content_block_start" && event.content_block.type === "tool_use"),
+    "no tool_use block emitted",
+  );
+});
+
+test("translates a non-streaming message.thinking into a leading thinking content block", async () => {
+  upstreamMessage = {
+    model: "deepseek-v4-flash:0731",
+    message: { role: "assistant", content: "Result", thinking: "Let me reason about this." },
+    done: true,
+    done_reason: "stop",
+    prompt_eval_count: 4242,
+    eval_count: 17,
+  };
+
+  const res = await messages({ model: "m", stream: false, messages: [{ role: "user", content: "hi" }] });
+  const body = await res.json();
+
+  // Thinking first, and the same flat shape the streaming path emits.
+  assert.deepEqual(body.content, [
+    { type: "thinking", thinking: "Let me reason about this.", signature: "" },
+    { type: "text", text: "Result" },
+  ]);
+});
+
+test("forwards an echoed thinking block upstream as message.thinking", async () => {
+  await (await messages({
+    model: "m",
+    stream: true,
+    messages: [
+      { role: "user", content: "hi" },
+      { role: "assistant", content: [{ type: "thinking", thinking: "Prior reasoning.", signature: "sig" }, { type: "text", text: "Prior answer." }] },
+      { role: "user", content: "and now?" },
+    ],
+  })).text();
+
+  const sent = upstreamRequests.at(-1).messages;
+  const assistant = sent.find((m) => m.role === "assistant");
+  assert.equal(assistant.thinking, "Prior reasoning.");
+  assert.equal(assistant.content, "Prior answer.");
+});
+
 test("does not translate a DSML invocation for an unoffered tool", async () => {
   upstreamChunks = [
     { model: "deepseek-v4-flash:0731", message: { role: "assistant", content: "<｜DSML｜invoke name=\"Bash\">\n<｜DSML｜parameter name=\"command\">pwd<｜DSML｜parameter>\n</｜DSML｜invoke>" }, done: true, done_reason: "stop", prompt_eval_count: 3, eval_count: 2 },
@@ -744,4 +873,35 @@ test("refuses a non-loopback PROXY_UPSTREAM instead of leaking the key to it", a
   const [code] = await once(child, "exit");
   assert.equal(code, 1);
   assert.match(stderr, /must point at loopback/);
+});
+
+// Boots the real proxy with PROXY_THINK set to `value` and reads back the flag
+// the proxy resolved from it. The env is parsed once at module load, so a
+// subprocess is the only way to exercise it.
+async function resolvedThinkFlag(value) {
+  const env = { ...process.env, OLLAMA_CLOUD_API_KEY: "test-key", PROXY_PORT: "0" };
+  delete env.PROXY_THINK;
+  if (value !== undefined) env.PROXY_THINK = value;
+  const child = spawn(process.execPath, [new URL("./proxy.mjs", import.meta.url).pathname], {
+    env,
+    stdio: ["ignore", "ignore", "pipe"],
+  });
+  try {
+    const [startup] = await once(child.stderr, "data");
+    const port = String(startup).match(/127\.0\.0\.1:(\d+)/)[1];
+    const res = await fetch(`http://127.0.0.1:${port}/healthz`);
+    return (await res.json()).think;
+  } finally {
+    child.kill();
+    await once(child, "exit");
+  }
+}
+
+test("reads every ordinary off spelling of PROXY_THINK as off", async () => {
+  // An operator who writes PROXY_THINK=0 means off. Treating anything but the
+  // literal string "false" as on would pass thinking through anyway.
+  assert.equal(await resolvedThinkFlag(undefined), true, "default is on");
+  assert.equal(await resolvedThinkFlag("false"), false);
+  assert.equal(await resolvedThinkFlag("0"), false);
+  assert.equal(await resolvedThinkFlag("OFF"), false);
 });
